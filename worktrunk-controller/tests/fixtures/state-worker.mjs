@@ -2,10 +2,17 @@ import fs from 'node:fs';
 import { Store } from '../../lib/store.mjs';
 import { enroll } from '../../lib/identity.mjs';
 import { ingest } from '../../lib/events.mjs';
+import { acquireCleanup, reserve } from '../../lib/admission.mjs';
 
 const [mode, directory, root, gitDir] = process.argv.slice(2);
 const store = new Store(directory);
-if (mode === 'events') {
+if (mode.startsWith('claim-')) {
+  try {
+    const record = mode === 'claim-cleanup' ? acquireCleanup(store, { roots: [root], owner: 'test' }) : reserve(store, { roots: [root], owner: 'test', sessionId: 's' });
+    fs.writeSync(1, `claimed ${record.token}\n`);
+    if (mode === 'claim-interrupt') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);
+  } catch (error) { fs.writeSync(1, `blocked ${error.message}\n`); }
+} else if (mode === 'events') {
   const config = { eventSources: [{ id: 'host', instance: 'host-1', role: 'host', projects: ['p'], authority: null }] };
   for (let i = 0; i < 20; i++) ingest(config, store, 'host', { version: 1, eventId: `${root}-${i}`, project: 'p', type: 'working', sessionId: root });
   console.log('20 events committed');

@@ -39,6 +39,12 @@ export function loadConfig(filename) {
   for (const key of ['timeoutMs', 'maxFiles', 'maxBytes']) integer(limits[key], `limits.${key}`, 1);
   const artifactRoots = value.artifactRoots ?? [];
   if (!Array.isArray(artifactRoots)) throw new Error('artifactRoots must be an array');
+  let nativeHost = null;
+  if (value.nativeHost !== undefined) {
+    const host = object(value.nativeHost, 'nativeHost');
+    if (host.version !== 1 || !/^[a-f0-9]{64}$/.test(host.sha256 ?? '')) throw new Error('Unsupported or unpinned native host');
+    nativeHost = { path: localPath(host.path), sha256: host.sha256, version: host.version };
+  }
   const sourceIds = new Set(), instances = new Set();
   if (value.eventSources !== undefined && !Array.isArray(value.eventSources)) throw new Error('eventSources must be an array');
   const eventSources = (value.eventSources ?? []).map(source => {
@@ -50,6 +56,6 @@ export function loadConfig(filename) {
     if (!Array.isArray(source.projects) || !source.projects.length || source.projects.some(id => !ids.has(id)) || new Set(source.projects).size !== source.projects.length) throw new Error('Source projects must be registered and unique');
     return { id, instance, role: source.role, projects: [...source.projects].sort(), authority: source.role === 'task' ? text(source.authority, 'source.authority') : null };
   });
-  const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, projects, stateDir, quarantineDir, policy, limits, artifactRoots, eventSources };
+  const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, nativeHost, projects, stateDir, quarantineDir, policy, limits, artifactRoots, eventSources };
   return { ...normalized, generation: digest(normalized) };
 }

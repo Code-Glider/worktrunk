@@ -1,12 +1,12 @@
 # Worktrunk controller
 
-This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion and read-only reports are implemented. Managed producer admission, quarantine, restore and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
+This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion, read-only reports and cooperative Windows producer admission are implemented. Quarantine, restore and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
 
 Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` and `purge` are unavailable. The controller never treats ignored agent configuration as disposable cache.
 
 ## Development
 
-Use the repository's Rust 1.98 toolchain and Node 24.15.x. There are no controller runtime dependencies.
+Use the repository's Rust 1.98 toolchain and Node 24.15.x. The Node controller has no npm dependencies. Its native Windows lifetime helper uses the pinned `win32job` crate; the repository's prohibition on unsafe Rust remains enabled.
 
 ```console
 node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
@@ -40,7 +40,27 @@ Schema 2 carries an optional `observation` field only in the isolated profile. I
 
 Allowed repository metadata effects include Worktrunk's bounded SHA caches/LRU and existing audit-log permission hardening under `.git/wt`. Refs, real indexes and checkout contents must survive. SQLite records scans and decisions outside managed roots. Successful invocations remove only their own scratch; failed probes retain private scratch for explicit recovery. These leftovers are not yet swept automatically.
 
-Native Windows fixtures currently pass. The full documentation sync is excluded by upstream on Windows; the schema was generated from the binary and schema unit tests pass. Linux CI and the remaining roadmap gates must be measured before their platforms or cleanup operations are called qualified.
+The published observation/telemetry slice passed Windows and Linux CI, including documentation sync on Linux. The native lifetime helper has separate Windows fixtures; Linux/WSL producer containment is unavailable. Remaining roadmap gates must be measured before cleanup operations are called qualified.
+
+## Managed producer admission
+
+`run` is an explicit, noninteractive launch command for cooperative native Windows agents. It requires a registered repository, an exactly enrolled checkout and an optional `nativeHost` configuration pin:
+
+```json
+{"nativeHost":{"path":"C:/worktrunk/target/release/wt-controller-host.exe","sha256":"replace-with-helper-sha256","version":1}}
+```
+
+Build the helper with `cargo build --locked --release --bin wt-controller-host`. Leave `nativeHost` absent when only scanning or reporting. No agent adapter is installed by this command.
+
+```console
+node worktrunk-controller/bin/controller.mjs run --config <absolute-config.json> --project <registry-id> --path <enrolled-checkout> --session <explicit-session-id> --program <absolute-agent-executable> -- <agent-arguments>...
+```
+
+The controller durably reserves the checkout before it starts the helper. The helper joins an anonymous Windows Job Object before spawning user code and waits for a committed acknowledgement. It acknowledges completion only when the direct command and every contained descendant have exited. Detached or suspended descendants keep the claim active. Agent stdin is closed; stdout and stderr go to controller stderr so output cannot impersonate the helper protocol. Controller stdout carries the result, and the direct command's exit status is preserved.
+
+Producer and cleanup claims share one serialized namespace. Producers may coexist; overlapping parent/child cleanup claims cannot coexist with any active or unresolved producer. A missing, moved or recreated outstanding root has unknown ancestry and blocks all cleanup acquisition in this state database; an uncertain cleanup root also blocks all producer admission. Reservations, interrupted startup, failed writes and missing completion remain protected across restart. No lease expiry, PID disappearance, observer event or task outcome releases them. This slice provides no automatic claim repair.
+
+This is a cooperative contract, not a sandbox: launch the actual native agent and keep every writer inside its process tree and declared checkout. Windows Job Objects do not cover processes dispatched through WMI, services, another existing process, remote hosts or WSL. Such launchers and independent writers are unsupported. No absence of claims proves that unmanaged writers are absent; scans continue to retain every candidate. Native Windows fixture success does not qualify a real launcher or enable cleanup. See the [Windows lifetime contract](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) for the underlying process boundary.
 
 ## Events and throughput
 

@@ -10,9 +10,9 @@ import { loadConfig } from '../lib/config.mjs';
 
 export const controllerRoot = fileURLToPath(new URL('../', import.meta.url));
 
-export function nativeWorktrunk() {
-  const messages = execFileSync('cargo', ['build', '--locked', '--bin', 'wt', '--message-format=json'], { cwd: path.dirname(controllerRoot), encoding: 'utf8', timeout: 300000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
-  const artifact = messages.split('\n').filter(Boolean).map(line => JSON.parse(line)).findLast(message => message.reason === 'compiler-artifact' && message.target.name === 'wt' && message.executable);
+export function nativeWorktrunk(name = 'wt') {
+  const messages = execFileSync('cargo', ['build', '--locked', '--bin', name, '--message-format=json'], { cwd: path.dirname(controllerRoot), encoding: 'utf8', timeout: 300000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+  const artifact = messages.split('\n').filter(Boolean).map(line => JSON.parse(line)).findLast(message => message.reason === 'compiler-artifact' && message.target.name === name && message.executable);
   assert.ok(artifact, 'Cargo must report the actual executable');
   return artifact.executable;
 }

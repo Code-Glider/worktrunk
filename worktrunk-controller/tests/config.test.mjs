@@ -34,6 +34,16 @@ test('unsupported schemas, execution domains and incomplete inputs fail closed',
   delete s.config.policy.retentionMs; assert.throws(s.load, /retentionMs/);
 });
 
+test('native lifetime host is optional but must declare a pinned supported protocol', t => {
+  const s = setup(t);
+  assert.equal(s.load().nativeHost, null);
+  s.config.nativeHost = { path: process.execPath, sha256: 'a'.repeat(64), version: 1 };
+  const pinned = s.load(); assert.equal(pinned.nativeHost.version, 1);
+  s.config.nativeHost.sha256 = 'unknown'; assert.throws(s.load, /unpinned native host/);
+  s.config.nativeHost.sha256 = 'b'.repeat(64); assert.notEqual(s.load().generation, pinned.generation);
+  s.config.nativeHost.version = 2; assert.throws(s.load, /unpinned native host/);
+});
+
 test('duplicate registry IDs and state under a project are rejected', t => {
   const s = setup(t);
   fs.writeFileSync(s.registry, JSON.stringify({ version: 1, projects: [{ id: 'same', root: './myproject' }, { id: 'same', root: './myproject' }] }));
