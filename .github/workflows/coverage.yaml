@@ -2,9 +2,9 @@ name: coverage
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'fork/**' ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, 'fork/**' ]
   workflow_dispatch:
 
 # Keyed per-commit on main, so a merge train can't cancel a queued upload:

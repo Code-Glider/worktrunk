@@ -25,6 +25,16 @@ Fresh critique: PR #2 is stacked on `fork/nested-worktree-safety`; both push and
 
 Reviewed with ds-review-loop: 1 round, fresh gpt-6-astra (high), verdict APPROVE; no findings fixed or declined. Reviewer independently confirmed `git diff --check`, exactly two branch-filter replacements and unchanged jobs/commands and authority boundaries. Scope before review: 2 files, 10 insertions/2 deletions; only this evidence paragraph was added afterward. Remote execution remains unverified until publication.
 
+## Fork coverage qualification
+
+1. Extend only the inherited `coverage.yaml` push and pull-request filters to `fork/**`. Check: exactly two replacements, unchanged job body and `git diff --check`.
+2. Run fresh scoped review, publish and verify GitHub starts coverage for the exact head. Check: no unresolved material findings and a registered run at the new commit.
+3. Inspect coverage, full CI and controller outcomes, then update PR #2. Check: report generation and upload have separate evidence; no `codecov/patch` pass is claimed without its actual result.
+
+Fresh critique: this stacked PR targets a fork branch, so both filters must include it. The existing same-repository PR upload rule remains a hard failure; missing service configuration must remain visible. Rust coverage does not instrument the Node controller, whose test gate remains separate. Tests, environments, tokens and upload rules are unchanged. Full CI at `7ea0076fda34a341c877c09a9e167542aa0a3696` passed lint, feature builds, MSRV, documentation and fast-checks; all three full-suite jobs are still running. Controller run 42190950792 passed on Windows (112 pass, 1 skip) and Linux (64 pass, 49 platform skips), including native contracts, hooks/schema and Linux documentation sync. Whole-worktree actions and real host/task authority remain unfinished.
+
+Coverage filter checks passed: a PowerShell comparison against `git show HEAD:.github/workflows/coverage.yaml` required exactly the two filter replacements and otherwise unchanged text; `git diff --check` passed. Reviewed with ds-review-loop: 1 round, fresh gpt-6-astra (high), verdict APPROVE; no findings fixed or declined. The reviewer independently repeated both checks. Scope before review: 2 files, 10 insertions/2 deletions; only this evidence paragraph was added afterward. Remote execution and upload remain pending publication.
+
 ## Scan/report scheduling package
 
 1. Add an observation-only PowerShell 7 runner that delegates to existing `scan` and `report`. Use explicit absolute paths, nonblocking config-adjacent `FileShare.None` for participating runners, concurrent bounded output forwarding and one monotonic wait budget plus five-second termination grace. Fix the completed seven-day UTC window once. Check: native parser, real repeated/restarted CLI cycles, Unicode/space arguments, exact windows, large output, scan/report/launch failures, timeout and cooperative overlap fixtures pass.
