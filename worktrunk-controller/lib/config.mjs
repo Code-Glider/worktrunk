@@ -42,7 +42,7 @@ export function loadConfig(filename) {
   const artifactIds = new Set();
   const artifactRoots = (value.artifactRoots ?? []).map(artifact => {
     object(artifact, 'artifact root');
-    if (Object.keys(artifact).some(key => !['id', 'path', 'owner', 'projects', 'managedOnly', 'retentionMs', 'classes'].includes(key))) throw new Error('Unknown artifact root field');
+    if (Object.keys(artifact).some(key => !['id', 'path', 'owner', 'projects', 'managedOnly', 'producerAdmission', 'retentionMs', 'classes'].includes(key))) throw new Error('Unknown artifact root field');
     const id = text(artifact.id, 'artifact.id'), owner = text(artifact.owner, 'artifact.owner');
     if (artifactIds.has(id)) throw new Error('Duplicate artifact ID');
     artifactIds.add(id);
@@ -51,6 +51,7 @@ export function loadConfig(filename) {
     if (protectedPaths.some(protectedRoot => overlap(root, protectedRoot)) || within(root, process.cwd()) || projects.some(project => within(root, project.root))) throw new Error('Artifact root overlaps protected paths');
     if (!Array.isArray(artifact.projects) || !artifact.projects.length || artifact.projects.some(id => !ids.has(id)) || new Set(artifact.projects).size !== artifact.projects.length) throw new Error('Artifact projects must be registered and unique');
     if (typeof artifact.managedOnly !== 'boolean') throw new Error('Artifact managedOnly must be explicit');
+    if (artifact.producerAdmission !== undefined && artifact.producerAdmission !== 'cooperative-windows-job-v1') throw new Error('Unsupported artifact producer admission contract');
     integer(artifact.retentionMs, 'artifact.retentionMs', 1);
     if (!Array.isArray(artifact.classes)) throw new Error('Artifact classes must be an explicit array');
     const rules = new Set();
@@ -64,7 +65,7 @@ export function loadConfig(filename) {
       rules.add(key);
       return { path: relative, kind: rule.kind };
     }).sort((a, b) => a.path.localeCompare(b.path));
-    return { id, path: root, owner, projects: [...artifact.projects].sort(), managedOnly: artifact.managedOnly, retentionMs: artifact.retentionMs, classes };
+    return { id, path: root, owner, projects: [...artifact.projects].sort(), managedOnly: artifact.managedOnly, producerAdmission: artifact.producerAdmission ?? null, retentionMs: artifact.retentionMs, classes };
   });
   for (let i = 0; i < artifactRoots.length; i++) for (let j = 0; j < i; j++) if (overlap(artifactRoots[i].path, artifactRoots[j].path)) throw new Error('Artifact roots must not overlap; declare shared roots once');
   let nativeHost = null;

@@ -11,8 +11,10 @@ import { decideArtifact } from '../lib/policy.mjs';
 import { controller, git, nativeWorktrunk } from './helpers.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { report } from '../lib/report.mjs';
+import { createHash } from 'node:crypto';
 
 const binary = nativeWorktrunk();
+const host = process.platform === 'win32' ? nativeWorktrunk('wt-controller-host') : null;
 
 function setup(t, classes = [], executable = process.execPath) {
   let store;
@@ -36,6 +38,30 @@ test('stale and ignored content has no inferred cache disposition; scans never e
   assert.ok(scan.reasons.includes('unmanaged_incarnation'));
   assert.equal(s.store.list('artifact_identity').length, 0);
   assert.equal(fs.readFileSync(path.join(s.artifact, 'old.tmp'), 'utf8'), 'unique old content');
+});
+
+test('artifact eligibility needs explicit cooperative opt-in and fresh native helper evidence', t => {
+  const s = setup(t, [{ path: '.', kind: 'reproducible_cache' }]);
+  fs.writeFileSync(path.join(s.artifact, 'cache'), 'reproducible');
+  enrollArtifact(s.config, s.store, 'cache', 1000);
+  assert.equal(inspectArtifact(s.config, s.store, 'cache', 100000).evidence.producerAdmission, false);
+  s.config.artifactRoots[0].producerAdmission = 'cooperative-windows-job-v1';
+  assert.equal(inspectArtifact(s.config, s.store, 'cache', 100000).status, 'retain');
+  if (process.platform !== 'win32') {
+    s.config.nativeHost = { path: process.execPath, sha256: 'a'.repeat(64), version: 1 };
+    assert.equal(inspectArtifact(s.config, s.store, 'cache', 100000).evidence.producerAdmission, false);
+    return;
+  }
+  s.config.nativeHost = { path: host, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex'), version: 1 };
+  const qualified = inspectArtifact(s.config, s.store, 'cache', 100000);
+  assert.equal(qualified.status, 'eligible');
+  assert.equal(qualified.evidence.nativeHost.sha256, s.config.nativeHost.sha256);
+  s.config.artifactRoots[0].managedOnly = false;
+  assert.equal(inspectArtifact(s.config, s.store, 'cache', 100000).status, 'retain');
+  s.config.artifactRoots[0].managedOnly = true;
+  s.config.nativeHost.sha256 = '0'.repeat(64);
+  assert.equal(inspectArtifact(s.config, s.store, 'cache', 100000).status, 'analysis_failed');
+  assert.equal(fs.readFileSync(path.join(s.artifact, 'cache'), 'utf8'), 'reproducible');
 });
 
 test('mixed roots protect agent configuration, credentials, evidence and unknown descendants after expiry', t => {

@@ -7,6 +7,7 @@ import { fileIdentity, localPath, overlap, within } from './paths.mjs';
 import { inactive } from './admission.mjs';
 import { inventoryContents } from './observe.mjs';
 import { decideArtifact } from './policy.mjs';
+import { verifyNativeHost } from './native-host.mjs';
 
 function configured(config, id) {
   const artifact = config.artifactRoots.find(root => root.id === id);
@@ -61,10 +62,12 @@ export function inspectArtifact(config, store, artifactId, now = Date.now()) {
     classes[classification(artifact, '.')]++;
     const contents = inventoryContents(root, config.limits, { skipGit: false, visitEntry(relative) { classes[classification(artifact, relative)]++; } });
     if (digest(before) !== digest(fileIdentity(root))) throw new Error('Artifact incarnation changed during inventory');
+    const nativeHost = artifact.producerAdmission === 'cooperative-windows-job-v1' && process.platform === 'win32' && config.nativeHost ? verifyNativeHost(config) : null;
     const evidence = {
       identity: enrolled?.id ?? null, incarnation: before, enrolledAt: enrolled?.enrolledAt ?? null,
       ownerMatches: artifact.owner === config.host.id, managedOnly: artifact.managedOnly,
-      producerAdmission: false, inactiveProducers: inactive(store, root),
+      admissionContract: artifact.producerAdmission ?? null, nativeHost,
+      producerAdmission: nativeHost !== null, inactiveProducers: inactive(store, root),
       protectedPath: [config.stateDir, config.quarantineDir, fileURLToPath(new URL('../', import.meta.url))].some(protectedRoot => overlap(root, protectedRoot)) || within(root, process.cwd()),
       classes, contents, links: contents.links, nested: contents.nested,
     };

@@ -31,6 +31,8 @@ jobs:
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build controller fixtures
+        run: cargo build --locked --bin wt --bin wt-controller-host
       - name: Controller tests
         run: node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
       - name: Native observation contract

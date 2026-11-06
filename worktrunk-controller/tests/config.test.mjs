@@ -50,6 +50,11 @@ test('artifact roots require explicit ownership, literal classes and separate pr
   const artifact = { id: 'cache', path: root, owner: 'test-host', projects: ['myproject'], managedOnly: true, retentionMs: 1000, classes: [{ path: '.', kind: 'reproducible_cache' }, { path: '.archon', kind: 'configuration' }] };
   s.config.artifactRoots = [artifact];
   const valid = s.load(); assert.equal(valid.artifactRoots[0].path, root);
+  assert.equal(valid.artifactRoots[0].producerAdmission, null);
+  artifact.producerAdmission = 'cooperative-windows-job-v1';
+  assert.notEqual(s.load().generation, valid.generation);
+  artifact.producerAdmission = true; assert.throws(s.load, /producer admission contract/);
+  delete artifact.producerAdmission;
   const helper = path.join(root, 'lifetime-host'); fs.writeFileSync(helper, 'pinned helper');
   s.config.nativeHost = { path: helper, sha256: 'a'.repeat(64), version: 1 }; assert.throws(s.load, /protected native host/); delete s.config.nativeHost;
   for (const relative of ['../outside', '/absolute', 'cache\\outside', 'C:outside', 'cache/*', 'cache//child']) {

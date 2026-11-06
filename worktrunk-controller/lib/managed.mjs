@@ -1,25 +1,20 @@
-import fs from 'node:fs';
-import { createHash } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { digest, text } from './data.mjs';
 import { fileIdentity, localPath } from './paths.mjs';
 import { reserve, transition } from './admission.mjs';
 import { producerRoots } from './artifacts.mjs';
+import { verifyNativeHost } from './native-host.mjs';
 
 export async function runManaged(config, store, { root, projectId, sessionId, program, args }) {
   if (process.platform !== 'win32' || !config.nativeHost) throw new Error('Qualified native Windows lifetime host required');
   root = localPath(root); program = localPath(program); text(sessionId, 'sessionId');
   if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string' || arg.includes('\0'))) throw new Error('Invalid managed command arguments');
-  const host = localPath(config.nativeHost.path), identity = fileIdentity(host);
-  const hash = () => createHash('sha256').update(fs.readFileSync(host)).digest('hex');
-  if (hash() !== config.nativeHost.sha256) throw new Error('Native host executable hash changed');
-  const version = spawnSync(host, ['--version'], { windowsHide: true, encoding: 'utf8', timeout: config.limits.timeoutMs });
-  if (version.status !== 0 || version.stdout.trim() !== 'wt-controller-host 1') throw new Error('Unsupported native host protocol');
+  const host = verifyNativeHost(config);
   const claim = reserve(store, { roots: producerRoots(config, store, projectId, root), sessionId, owner: config.host.id });
   transition(store, claim.token, 'reserved', 'starting');
   let phase = 'starting', result;
-  const child = spawn(host, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'inherit'] });
+  const child = spawn(host.path, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'inherit'] });
   child.stdin.on('error', () => {});
   const finished = new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal })); });
   // Attach immediately: an early spawn failure must not become an unhandled rejection.
@@ -33,12 +28,12 @@ export async function runManaged(config, store, { root, projectId, sessionId, pr
       if (message.version !== 1 || message.evidence?.helperPid !== child.pid || message.evidence?.launchToken !== claim.token) throw new Error('Native lifetime response mismatch');
       if (message.type === 'contained' && phase === 'starting' && message.evidence.activeProcesses === null) {
         if (digest(producerRoots(config, store, projectId, root)) !== digest(claim.roots.map(root => root.path)) || claim.roots.some(root => digest(fileIdentity(root.path)) !== digest(root.incarnation))) throw new Error('Managed root incarnation changed before launch');
-        if (digest(identity) !== digest(fileIdentity(host)) || hash() !== config.nativeHost.sha256) throw new Error('Native host executable changed before launch');
+        if (digest(host) !== digest(verifyNativeHost(config))) throw new Error('Native host executable changed before launch');
         transition(store, claim.token, phase, 'running', message.evidence);
         phase = 'running';
         child.stdin.write(`ack ${claim.token}\n`);
       } else if (message.type === 'ended' && phase === 'running') {
-        if (digest(identity) !== digest(fileIdentity(host)) || hash() !== config.nativeHost.sha256) throw new Error('Native host executable changed during launch');
+        if (digest(host) !== digest(verifyNativeHost(config))) throw new Error('Native host executable changed during launch');
         transition(store, claim.token, phase, 'ended', message.evidence);
         phase = 'ended'; result = { token: claim.token, exitCode: message.exitCode };
       } else throw new Error('Invalid native lifetime protocol transition');
