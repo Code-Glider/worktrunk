@@ -15,6 +15,16 @@ Goal: implement the eight stages in [AUTOMATION_PLAN.md](../AUTOMATION_PLAN.md) 
 
 Each stage will record exact commands/results here before it is marked complete. `node --test worktrunk-controller/tests/*.test.mjs` is the controller gate; Rust changes use the declared 1.98 toolchain and repository checks. Do not silently replace an acceptance check with a smaller unit test.
 
+## Fork-wide qualification
+
+1. Extend the inherited full CI workflow's push and pull-request branch filters to `fork/**`, retaining every job and command. Check: only two trigger lines change and GitHub starts the workflow at the published head.
+2. Review, publish and inspect lint, feature-check, all three platform test jobs and fast-checks. Check: actual outcomes are recorded; failures are diagnosed and corrected without weakening checks.
+3. Update the PR with exact full/controller CI coverage and remaining limitations. Check: clean pushed tree, no merge or deployment, and task-authority/whole-worktree gaps remain explicit.
+
+Fresh critique: PR #2 is stacked on `fork/nested-worktree-safety`; both push and PR filters must include fork branches. GitHub lists only controller/release/Tend workflows for this fork. Dispatching existing `ci.yaml` at `fork/controller` returned HTTP 404 although the workflow file exists on main. Triggering the inherited workflow reuses its setup and full checks without a duplicate pipeline or local tool installation. Scheduler commit `b4f3bd0b93434b71b4fd67ce406f9d79a2642eb0` passed controller run 42189238555 on Windows (112 pass, 1 skip) and Linux (64 pass, 49 skips), including both native contracts, hooks/schema and Linux documentation sync. The separate inherited Tend review fails because the fork lacks `TEND_BOT_TOKEN`; service/secret configuration is unchanged.
+
+Reviewed with ds-review-loop: 1 round, fresh gpt-6-astra (high), verdict APPROVE; no findings fixed or declined. Reviewer independently confirmed `git diff --check`, exactly two branch-filter replacements and unchanged jobs/commands and authority boundaries. Scope before review: 2 files, 10 insertions/2 deletions; only this evidence paragraph was added afterward. Remote execution remains unverified until publication.
+
 ## Scan/report scheduling package
 
 1. Add an observation-only PowerShell 7 runner that delegates to existing `scan` and `report`. Use explicit absolute paths, nonblocking config-adjacent `FileShare.None` for participating runners, concurrent bounded output forwarding and one monotonic wait budget plus five-second termination grace. Fix the completed seven-day UTC window once. Check: native parser, real repeated/restarted CLI cycles, Unicode/space arguments, exact windows, large output, scan/report/launch failures, timeout and cooperative overlap fixtures pass.
