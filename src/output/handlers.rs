@@ -1213,14 +1213,10 @@ pub fn handle_remove_output(
     quiet: bool,
     announcer: &mut HookAnnouncer<'_>,
 ) -> CommandResult<BranchFate> {
-    handle_remove_output_inner(plan, execution, stdin, hook_plan, quiet, false, announcer)
+    handle_remove_output_inner(plan, execution, stdin, hook_plan, quiet, announcer)
 }
 
-/// Merge may select a source containing another checkout, including the
-/// invoking worktree. Recheck its topology after pre-remove hooks, before the
-/// removal core's final safety gates. This is merge-specific: ordinary remove
-/// and batch prune retain their concurrent staging without a live registry
-/// read before each rename.
+/// Merge uses the same post-hook topology guard as ordinary removal and prune.
 pub fn handle_merge_remove_output(
     plan: &RemovalPlan,
     hook_plan: &ApprovedHookPlan,
@@ -1232,7 +1228,6 @@ pub fn handle_merge_remove_output(
         ForegroundStdin::Inherit,
         hook_plan,
         false,
-        true,
         announcer,
     )
 }
@@ -1243,7 +1238,6 @@ fn handle_remove_output_inner(
     stdin: ForegroundStdin,
     hook_plan: &ApprovedHookPlan,
     quiet: bool,
-    protect_nested_worktrees: bool,
     announcer: &mut HookAnnouncer<'_>,
 ) -> CommandResult<BranchFate> {
     match plan {
@@ -1273,7 +1267,6 @@ fn handle_remove_output_inner(
                 hook_plan,
                 execution,
                 stdin,
-                protect_nested_worktrees,
             },
             announcer,
         ),
@@ -1808,7 +1801,6 @@ struct WorktreeRemovalContext<'a> {
     hook_plan: &'a ApprovedHookPlan,
     execution: RemovalExecution,
     stdin: ForegroundStdin,
-    protect_nested_worktrees: bool,
 }
 
 impl WorktreeRemovalContext<'_> {
@@ -2116,16 +2108,7 @@ fn handle_removed_worktree_output(
     // ownership/lock/dirty gates in the removal core, so edits made during
     // the wait are checked before staging. Also precede the cd directive:
     // refusing cleanup must not move the invoking shell.
-    if ctx.protect_nested_worktrees
-        && let Some(nested) = worktrunk::git::remove::nested_worktree(&repo, ctx.worktree_path)?
-    {
-        return Err(anyhow::anyhow!(cformat!(
-            "Cannot remove worktree @ <bold>{}</>; contains worktree @ <bold>{}</>",
-            format_path_for_display(ctx.worktree_path),
-            format_path_for_display(&nested)
-        ))
-        .into());
-    }
+    worktrunk::git::remove::require_no_nested_worktrees(&repo, ctx.worktree_path)?;
 
     // The pre-rename `ensure_clean` catches a hook-dirtied worktree, and the
     // branch deletion re-decides against fresh refs (`delete_branch_if_safe`'s
