@@ -19,9 +19,9 @@ function binding(artifact) {
   return digest({ id: artifact.id, path: artifact.path, owner: artifact.owner, projects: artifact.projects });
 }
 
-function identity(store, artifact) {
+function identity(store, artifact, root = artifact.path) {
   const record = store.get('artifact_identity', artifact.id)?.value;
-  return record?.binding === binding(artifact) && digest(record.incarnation) === digest(fileIdentity(artifact.path)) ? record : null;
+  return record?.binding === binding(artifact) && digest(record.incarnation) === digest(fileIdentity(root)) ? record : null;
 }
 
 export function enrollArtifact(config, store, artifactId, now = Date.now()) {
@@ -55,9 +55,12 @@ export function inspectArtifact(config, store, artifactId, now = Date.now(), own
   const target = { kind: 'artifact', artifactId, path: artifact.path, projects: artifact.projects };
   let decision;
   try {
-    const root = localPath(artifact.path);
+    const claim = ownCleanupToken && store.get('claim', ownCleanupToken)?.value;
+    const action = claim?.actionId && store.get('action', claim.actionId)?.value;
+    if (claim?.roots[0]?.currentPath && (!action || action.artifactId !== artifactId || action.owner !== config.host.id || action.domain !== process.platform || action.originalPath !== artifact.path || !/^[a-f0-9-]{36}$/.test(action.id) || claim.roots[0].currentPath !== path.join(config.quarantineDir, action.id, 'payload'))) throw new Error('Artifact cleanup relocation does not match configuration');
+    const root = localPath(claim?.roots[0]?.currentPath ?? artifact.path);
     if (!fs.statSync(root).isDirectory()) throw new Error('Artifact root must be a directory');
-    const before = fileIdentity(root), enrolled = identity(store, artifact);
+    const before = fileIdentity(root), enrolled = identity(store, artifact, root);
     const classes = { reproducible_cache: 0, configuration: 0, credentials: 0, evidence: 0, unknown: 0 };
     classes[classification(artifact, '.')]++;
     const contents = inventoryContents(root, config.limits, { skipGit: false, visitEntry(relative) { classes[classification(artifact, relative)]++; } });
@@ -68,7 +71,7 @@ export function inspectArtifact(config, store, artifactId, now = Date.now(), own
       ownerMatches: artifact.owner === config.host.id, managedOnly: artifact.managedOnly,
       admissionContract: artifact.producerAdmission ?? null, nativeHost,
       producerAdmission: nativeHost !== null, inactiveProducers: inactive(store, root, ownCleanupToken),
-      protectedPath: [config.stateDir, config.quarantineDir, fileURLToPath(new URL('../', import.meta.url))].some(protectedRoot => overlap(root, protectedRoot)) || within(root, process.cwd()),
+      protectedPath: [config.stateDir, config.quarantineDir, fileURLToPath(new URL('../', import.meta.url))].some(protectedRoot => overlap(artifact.path, protectedRoot)) || within(artifact.path, process.cwd()),
       classes, contents, links: contents.links, nested: contents.nested,
     };
     decision = { ...target, ...decideArtifact(evidence, config.policy, now), evidence };

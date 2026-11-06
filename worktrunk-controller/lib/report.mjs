@@ -155,7 +155,7 @@ export function report(config, store, { from, to, now = Date.now() }) {
   });
   return {
     version: 1, from, to, asOf: now, applyEnabled: Boolean(config.policy?.allowApply && process.platform === 'win32' && config.nativeHost), worktreeApplyEnabled: false,
-    actions: store.list('action').map(row => row.value).filter(action => action.owner === config.host?.id && action.projects?.some(id => registered.has(id))).map(action => ({ id: action.id, artifactId: action.artifactId, phase: action.phase, originalPath: action.originalPath, payloadPath: action.payloadPath, createdAt: action.createdAt, quarantinedAt: action.quarantinedAt, error: action.error })),
+    actions: store.list('action').map(row => row.value).filter(action => action.owner === config.host?.id && action.projects?.some(id => registered.has(id))).map(action => ({ id: action.id, artifactId: action.artifactId, phase: action.phase, originalPath: action.originalPath, payloadPath: action.payloadPath, createdAt: action.createdAt, quarantinedAt: action.quarantinedAt, purgedAt: action.purgedAt ?? null, purgeOutcome: action.purgeOutcome ?? null, error: action.error })),
     coverage: [...sourceMap.values()].map(source => sourceCoverage(source, allEvents)),
     unassociatedTaskEvents, unassociatedSessionEvents,
     observedFirstAcceptedTasks: acceptedTasks.length,

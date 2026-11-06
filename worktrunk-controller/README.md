@@ -1,8 +1,8 @@
 # Worktrunk controller
 
-This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion, read-only reports, cooperative Windows producer admission and reversible selected artifact quarantine are implemented. Worktree actions and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
+This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion, read-only reports, cooperative Windows producer admission, reversible artifact quarantine and selected cache purge are implemented. Worktree actions are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
 
-Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` supports explicitly selected artifact decisions only; `purge` is unavailable. The controller never treats ignored agent configuration as disposable cache.
+Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` and `purge` support explicitly selected artifact decisions only. The controller never treats ignored agent configuration as disposable cache.
 
 ## Development
 
@@ -69,7 +69,22 @@ The result includes an action ID and both paths; errors after intent creation in
 
 Original and quarantine paths remain fenced against cooperative producers until restoration or proven pre-move cancellation. Filesystem moves and reconciliation share a SQLite write lock. If a controller stops, `reconcile` accepts only a matching native incarnation at exactly one location, completes its recorded direction or cancels an operation that provably never moved. It never retries an uncertain rename. Both locations, neither location, replaced parents/containers and a container created without a committed identity remain unresolved with the claim held. Such states require explicit repair; automatic repair is unavailable.
 
-`restore` works after cleanup is disabled or cache policy changes. Keep the same host, state and quarantine location. It refuses an occupied original path and verifies the original parent and quarantine container. If restoration was interrupted, reconcile it before retrying. Verified empty containers remain in quarantine; retention and purge are unavailable. This recovery covers process interruption and failed journal writes, not power-loss durability of directory renames or hostile filesystem writers.
+`restore` works after cleanup is disabled or cache policy changes. Keep the same host, state and quarantine location. It refuses an occupied original path and verifies the original parent and quarantine container. If restoration was interrupted, reconcile it before retrying. Verified empty containers remain in quarantine. This recovery covers process interruption and failed journal writes, not power-loss durability of directory renames or hostile filesystem writers.
+
+## Selected cache purge
+
+After the artifact's retention period, review one quarantined action and select its new purge decision:
+
+```console
+node worktrunk-controller/bin/controller.mjs scan --config <absolute-config.json> --action <action-id> --format json
+node worktrunk-controller/bin/controller.mjs purge --config <absolute-config.json> --decision <purge-decision-id> --format json
+```
+
+Purge requires `policy.allowApply=true`, unchanged quarantined contents, matching enrollment/ownership and fresh cooperative producer evidence. Configuration, credentials, evidence, unknown content and conflicting producers veto it. The retention period is the longer of the original and current artifact settings. It starts after the verified quarantine move and requires conservative native uptime and wall-clock evidence; clock jumps, missing evidence and uncertain restart timing retain data. Older actions and moves recovered without a committed sample must be restored and quarantined again before purge.
+
+Purge deletes only cache descendants in the selected payload. It returns the same verified empty directory to the absent original path, preserving enrollment for the next managed producer. It retains branches and empty action containers. Full scans inspect configured original roots; use `scan --action` to inspect a quarantined payload.
+
+An interrupted purge can have deleted some files. Reconcile before proceeding: a verified empty original proves completion; a matching payload stays claimed and is permanently ineligible for another purge on that action. Restore then returns **remaining contents only**, with the interrupted outcome preserved in reports. Both/neither locations, substituted roots or nonempty original outcomes stay unresolved. Reconciliation never resumes deletion.
 
 ## Observation boundary
 

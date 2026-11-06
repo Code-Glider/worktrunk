@@ -10,7 +10,10 @@ import { setTimeout } from 'node:timers/promises';
 import { Store } from '../lib/store.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { enrollArtifact, inspectArtifact } from '../lib/artifacts.mjs';
-import { quarantineArtifact, restore, reconcile } from '../lib/actions.mjs';
+import { quarantineArtifact, restore, reconcile, inspectQuarantine, purgeArtifact } from '../lib/actions.mjs';
+import { sampleClock } from '../lib/retention.mjs';
+import { fileIdentity } from '../lib/paths.mjs';
+import { producerRoots } from '../lib/artifacts.mjs';
 import { inactive, reserve } from '../lib/admission.mjs';
 import { controller, git, nativeWorktrunk } from './helpers.mjs';
 
@@ -43,6 +46,203 @@ function setup(t) {
   store.transaction(tx => tx.put('decision', decision.id, { version: 1, ...decision, policyGeneration: config.generation }));
   return { ...s, root, config, store, decision };
 }
+
+function expired(s, action) {
+  const clock = sampleClock();
+  const retentionClock = Object.fromEntries(Object.entries(clock).map(([key, value]) => [key, value - 10000]));
+  s.store.transaction(tx => tx.put('action', action.id, { ...action, retentionClock }));
+  const decision = inspectQuarantine(s.config, s.store, action.id);
+  assert.equal(decision.status, 'eligible', JSON.stringify(decision));
+  s.store.transaction(tx => tx.put('decision', decision.id, { version: 1, ...decision, policyGeneration: s.config.generation }));
+  return decision;
+}
+
+test('quarantine review preserves baseline, enrollment and stable due decision identity', windows, t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id);
+  assert.deepEqual(action.baseline.contents, s.decision.evidence.contents);
+  const pending = inspectQuarantine(s.config, s.store, action.id, action.retentionClock);
+  assert.equal(pending.status, 'retain'); assert.ok(pending.reasons.includes('retention_pending'));
+  const due = expired(s, action), clock = sampleClock();
+  const later = Object.fromEntries(Object.entries(clock).map(([key, value]) => [key, value + 1000]));
+  assert.equal(inspectQuarantine(s.config, s.store, action.id, later).id, due.id);
+  assert.equal(fs.readFileSync(path.join(action.payloadPath, 'generated'), 'utf8'), 'reproducible content');
+  assert.throws(() => inactive(s.store, s.config.projects[0].root, action.claimToken), /Own cleanup/);
+  assert.equal(inactive(s.store, action.payloadPath), false);
+  assert.equal(inactive(s.store, action.payloadPath, action.claimToken), true);
+});
+
+test('legacy clocks, protected or changed payloads and another unresolved owner veto purge', windows, t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id);
+  s.store.transaction(tx => tx.put('action', action.id, { ...action, retentionClock: null }));
+  assert.ok(inspectQuarantine(s.config, s.store, action.id).reasons.includes('retention_clock_unknown'));
+  expired(s, action);
+  fs.writeFileSync(path.join(action.payloadPath, '.env'), 'protected');
+  assert.ok(inspectQuarantine(s.config, s.store, action.id).reasons.includes('artifact_credentials'));
+  fs.unlinkSync(path.join(action.payloadPath, '.env'));
+  fs.writeFileSync(path.join(action.payloadPath, 'generated'), 'changed');
+  assert.ok(inspectQuarantine(s.config, s.store, action.id).reasons.includes('quarantine_baseline_changed_or_unknown'));
+  fs.writeFileSync(path.join(action.payloadPath, 'generated'), 'reproducible content');
+  const producer = reserve(s.store, { roots: [s.config.projects[0].root], owner: 'other', sessionId: 'unknown' });
+  fs.renameSync(s.config.projects[0].root, `${s.config.projects[0].root}-retained`);
+  assert.ok(inspectQuarantine(s.config, s.store, action.id).reasons.includes('active_or_unresolved_producers'));
+  assert.equal(s.store.get('claim', producer.token).value.state, 'reserved');
+});
+
+test('selected purge deletes only cache descendants and preserves enrolled root for producers', windows, t => {
+  const s = setup(t), before = fileIdentity(s.root), action = quarantineArtifact(s.config, s.store, s.decision.id);
+  const sentinel = path.join(s.base, 'unrelated'); fs.writeFileSync(sentinel, 'keep');
+  const decision = expired(s, action);
+  assert.throws(() => purgeArtifact({ ...s.config, policy: { ...s.config.policy, allowApply: false } }, s.store, decision.id), /disabled/);
+  assert.throws(() => purgeArtifact(s.config, s.store, s.decision.id), /eligible artifact purge/);
+  const purged = purgeArtifact(s.config, s.store, decision.id);
+  assert.equal(purged.phase, 'purged'); assert.equal(purged.purgeOutcome, 'complete');
+  assert.deepEqual(fileIdentity(s.root), before); assert.deepEqual(fs.readdirSync(s.root), []);
+  assert.equal(fs.existsSync(action.payloadPath), false); assert.equal(inactive(s.store, s.root), true);
+  assert.equal(reserve(s.store, { roots: producerRoots(s.config, s.store, 'myproject', s.config.projects[0].root), owner: 'host', sessionId: 'after-purge' }).state, 'reserved');
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'keep');
+  assert.equal(reconcile(s.config, s.store, action.id).phase, 'purged');
+  assert.throws(() => purgeArtifact(s.config, s.store, decision.id), /decision changed/);
+});
+
+test('failed purge intent changes no bytes and changed selected content refuses deletion', windows, t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id), decision = expired(s, action);
+  s.store.db.exec("CREATE TRIGGER fail_purge BEFORE UPDATE ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='purging' BEGIN SELECT RAISE(ABORT,'purge intent failed'); END;");
+  assert.throws(() => purgeArtifact(s.config, s.store, decision.id), /purge intent failed/);
+  assert.equal(s.store.get('action', action.id).value.phase, 'quarantined');
+  assert.equal(fs.readFileSync(path.join(action.payloadPath, 'generated'), 'utf8'), 'reproducible content');
+  s.store.db.exec('DROP TRIGGER fail_purge');
+  fs.writeFileSync(path.join(action.payloadPath, 'generated'), 'changed after selection');
+  assert.throws(() => purgeArtifact(s.config, s.store, decision.id), /decision changed/);
+  assert.equal(fs.readFileSync(path.join(action.payloadPath, 'generated'), 'utf8'), 'changed after selection');
+});
+
+test('failed purge completion recovers empty original without repeating deletion', windows, t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id), decision = expired(s, action);
+  s.store.db.exec("CREATE TRIGGER fail_completion BEFORE UPDATE ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='purged' BEGIN SELECT RAISE(ABORT,'completion failed'); END;");
+  assert.throws(() => purgeArtifact(s.config, s.store, decision.id), /completion failed/);
+  assert.equal(s.store.get('action', action.id).value.phase, 'purging');
+  assert.deepEqual(fs.readdirSync(s.root), []); assert.equal(s.store.get('claim', action.claimToken).value.state, 'held');
+  s.store.db.exec('DROP TRIGGER fail_completion');
+  assert.equal(reconcile(s.config, s.store, action.id).phase, 'purged');
+  assert.equal(s.store.get('claim', action.claimToken).value.state, 'released');
+});
+
+for (const checkpoint of ['after-purge-intent', 'before-delete', 'after-one-delete', 'before-rename', 'after-rename']) {
+  test(`killed purge at ${checkpoint} never retries uncertain deletion`, windows, async t => {
+    const s = setup(t);
+    fs.writeFileSync(path.join(s.root, 'z-remaining'), 'keep until selected purge');
+    const selected = inspectArtifact(s.config, s.store, 'cache');
+    s.store.transaction(tx => tx.put('decision', selected.id, { version: 1, ...selected, policyGeneration: s.config.generation }));
+    const action = quarantineArtifact(s.config, s.store, selected.id), decision = expired(s, action);
+    const run = worker(s, 'purge', decision.id, checkpoint);
+    try {
+      await Promise.race([once(run.child.stdout, 'data'), run.done.then(result => { throw new Error(result.stderr); })]);
+    } finally { run.child.kill('SIGKILL'); await run.done; }
+    assert.equal(s.store.get('action', action.id).value.phase, 'purging');
+    const restarted = new Store(s.state);
+    try {
+      const recovered = reconcile(s.config, restarted, action.id);
+      if (checkpoint === 'after-rename') {
+        assert.equal(recovered.phase, 'purged'); assert.deepEqual(fs.readdirSync(s.root), []);
+        assert.equal(restarted.get('claim', action.claimToken).value.state, 'released');
+      } else {
+        assert.equal(recovered.phase, 'quarantined'); assert.equal(recovered.purgeOutcome, 'interrupted');
+        assert.equal(recovered.retentionClock, null); assert.equal(restarted.get('claim', action.claimToken).value.state, 'held');
+        assert.ok(inspectQuarantine(s.config, restarted, action.id).reasons.includes('interrupted_purge_restore_only'));
+        assert.throws(() => purgeArtifact(s.config, restarted, decision.id), /decision changed/);
+        const restored = restore(s.config, restarted, action.id);
+        assert.equal(restored.purgeOutcome, 'interrupted');
+        assert.deepEqual(fs.readdirSync(s.root), checkpoint === 'before-rename' ? [] : checkpoint === 'after-one-delete' ? ['z-remaining'] : ['generated', 'z-remaining']);
+      }
+    } finally { restarted.close(); }
+  });
+}
+
+test('on-disk policy change after purge intent prevents deletion', windows, async t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id), decision = expired(s, action);
+  const gate = path.join(s.base, 'continue'), run = worker(s, 'purge', decision.id, 'after-purge-intent', gate);
+  try {
+    await Promise.race([once(run.child.stdout, 'data'), run.done.then(result => { throw new Error(result.stderr); })]);
+    const raw = JSON.parse(fs.readFileSync(s.filename)); raw.policy.allowApply = false;
+    fs.writeFileSync(s.filename, JSON.stringify(raw)); fs.writeFileSync(gate, 'continue');
+    const result = await run.done; assert.equal(result.code, 1, result.stdout); assert.match(result.stderr, /Configuration changed/);
+    assert.equal(fs.readFileSync(path.join(action.payloadPath, 'generated'), 'utf8'), 'reproducible content');
+    const config = loadConfig(s.filename);
+    assert.equal(reconcile(config, s.store, action.id).purgeOutcome, 'interrupted');
+    assert.equal(restore(config, s.store, action.id).phase, 'restored');
+  } finally { fs.writeFileSync(gate, 'continue'); run.child.kill('SIGKILL'); await run.done; }
+});
+
+test('purge serializes reconciliation and competing purge controllers', windows, async t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id), decision = expired(s, action);
+  const gate = path.join(s.base, 'continue'), run = worker(s, 'purge', decision.id, 'before-delete', gate);
+  let recovery, competing;
+  try {
+    await Promise.race([once(run.child.stdout, 'data'), run.done.then(result => { throw new Error(result.stderr); })]);
+    recovery = worker(s, 'reconcile', action.id, 'starting');
+    competing = worker(s, 'purge', decision.id, 'starting');
+    await Promise.all([once(recovery.child.stdout, 'data'), once(competing.child.stdout, 'data')]);
+    await setTimeout(100); assert.equal(recovery.child.exitCode, null); assert.equal(competing.child.exitCode, null);
+    fs.writeFileSync(gate, 'continue');
+    const [purged, reconciled, other] = await Promise.all([run.done, recovery.done, competing.done]);
+    assert.equal(purged.code, 0, purged.stderr); assert.equal(reconciled.code, 0, reconciled.stderr); assert.equal(other.code, 1, other.stdout);
+    assert.equal(s.store.get('action', action.id).value.phase, 'purged'); assert.deepEqual(fs.readdirSync(s.root), []);
+  } finally {
+    fs.writeFileSync(gate, 'continue'); run.child.kill('SIGKILL'); await run.done;
+    for (const current of [recovery, competing]) if (current) { current.child.kill('SIGKILL'); await current.done; }
+  }
+});
+
+test('real CLI selects a due quarantine after native elapsed retention and purges only its contents', windows, async t => {
+  const s = setup(t), cli = fileURLToPath(new URL('../bin/controller.mjs', import.meta.url));
+  const action = quarantineArtifact(s.config, s.store, s.decision.id);
+  const invoke = args => spawnSync(process.execPath, [cli, ...args, '--config', s.filename, '--format', 'json'], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+  for (const args of [['purge'], ['purge', '--action', action.id], ['scan', '--action', action.id, '--project', 'myproject']]) assert.equal(invoke(args).status, 1);
+  const first = invoke(['scan', '--action', action.id]); assert.equal(first.status, 0, first.stderr);
+  const initial = JSON.parse(first.stdout).artifacts[0];
+  assert.ok(['retain', 'eligible'].includes(initial.status), first.stdout);
+  if (initial.status === 'retain') assert.ok(initial.reasons.includes('retention_pending'), first.stdout);
+  assert.equal(fs.readFileSync(path.join(action.payloadPath, 'generated'), 'utf8'), 'reproducible content');
+  await setTimeout(2200);
+  const scanned = invoke(['scan', '--action', action.id]); assert.equal(scanned.status, 0, scanned.stderr);
+  const selected = JSON.parse(scanned.stdout).artifacts[0]; assert.equal(selected.status, 'eligible', scanned.stdout);
+  assert.equal(invoke(['apply', '--decision', selected.id]).status, 1);
+  const purged = invoke(['purge', '--decision', selected.id]); assert.equal(purged.status, 0, purged.stderr);
+  assert.equal(JSON.parse(purged.stdout).phase, 'purged'); assert.deepEqual(fs.readdirSync(s.root), []);
+  const reported = invoke(['report', '--from', '1970-01-01', '--to', '2026-01-01']); assert.equal(reported.status, 0, reported.stderr);
+  assert.equal(JSON.parse(reported.stdout).actions[0].purgeOutcome, 'complete');
+});
+
+test('partial removal failure records error and restores only remaining contents', windows, async t => {
+  const s = setup(t); fs.writeFileSync(path.join(s.root, 'z-remaining'), 'remaining');
+  const selected = inspectArtifact(s.config, s.store, 'cache');
+  s.store.transaction(tx => tx.put('decision', selected.id, { version: 1, ...selected, policyGeneration: s.config.generation }));
+  const action = quarantineArtifact(s.config, s.store, selected.id), decision = expired(s, action);
+  const run = worker(s, 'purge', decision.id, 'fail-after-one-delete');
+  const result = await run.done; assert.equal(result.code, 1, result.stdout);
+  const failed = s.store.get('action', action.id).value;
+  assert.equal(failed.phase, 'purging'); assert.match(failed.error, /descendant removal failure/);
+  assert.equal(reconcile(s.config, s.store, action.id).purgeOutcome, 'interrupted');
+  assert.equal(restore(s.config, s.store, action.id).purgeOutcome, 'interrupted');
+  assert.deepEqual(fs.readdirSync(s.root), ['z-remaining']); assert.equal(fs.readFileSync(path.join(s.root, 'z-remaining'), 'utf8'), 'remaining');
+});
+
+test('retention cannot be shortened and current ownership or protected policy changes veto purge', windows, t => {
+  const s = setup(t), action = quarantineArtifact(s.config, s.store, s.decision.id), clock = sampleClock();
+  s.store.transaction(tx => tx.put('action', action.id, { ...action, retentionMs: 100000 }));
+  const later = Object.fromEntries(Object.entries(clock).map(([key, value]) => [key, value + 10000]));
+  assert.ok(inspectQuarantine(s.config, s.store, action.id, later).reasons.includes('retention_pending'));
+  expired(s, action);
+  const raw = JSON.parse(fs.readFileSync(s.filename)); raw.artifactRoots[0].retentionMs = 100000;
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  assert.ok(inspectQuarantine(loadConfig(s.filename), s.store, action.id).reasons.includes('retention_pending'));
+  raw.artifactRoots[0].retentionMs = 1; raw.artifactRoots[0].classes[0].kind = 'evidence';
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  assert.ok(inspectQuarantine(loadConfig(s.filename), s.store, action.id).reasons.includes('artifact_evidence'));
+  raw.artifactRoots[0].owner = 'other'; fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const changed = inspectQuarantine(loadConfig(s.filename), s.store, action.id);
+  assert.ok(changed.reasons.includes('artifact_owner_mismatch')); assert.ok(changed.reasons.includes('unmanaged_incarnation'));
+});
 
 test('selected artifact quarantine preserves content and holds both path fences', windows, t => {
   const s = setup(t);
