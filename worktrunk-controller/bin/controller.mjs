@@ -117,6 +117,7 @@ try {
       for (const week of output.weeks) process.stdout.write(`  Week ${week.week}: ${week.observedFirstAcceptedTasks}\n`);
       process.stdout.write(`Accepted task duration: median ${output.acceptedTaskDuration.medianMs ?? 'unavailable'} ms; p95 ${output.acceptedTaskDuration.p95Ms ?? 'unavailable'} ms; samples ${output.acceptedTaskDuration.samples}\n`);
       for (const artifact of output.artifacts) process.stdout.write(`  Artifact ${artifact.artifactId}: ${artifact.logicalBytes ?? 'unavailable'} logical bytes; observed growth ${artifact.growthBytes ?? 'unavailable'} bytes\n`);
+      process.stdout.write(`Artifact purges: ${output.artifactPurges.observedActions} actions; ${output.artifactPurges.logicalBytes ?? 'unavailable'} logical bytes; ${output.artifactPurges.unavailableTimeActions} actions with unavailable time\n`);
       for (const action of output.actions) process.stdout.write(`  Action ${action.id}: ${action.phase}${action.purgeOutcome === 'interrupted' ? '; interrupted purge, remaining contents only' : ''}${action.error ? ` (${action.error})` : ''}\n`);
       for (const source of output.coverage) process.stdout.write(`  ${source.source}: ${source.status}; observed events ${source.observedEvents}\n`);
     }

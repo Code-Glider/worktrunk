@@ -150,3 +150,43 @@ test('state-only events preserve the last explicit repository and worktree assoc
   const session = read().sessions[0];
   assert.equal(session.repositoryId, 'repo'); assert.equal(session.worktreeId, 'moved');
 });
+
+test('purge report counts completed owned actions once in the exact window without mutating evidence', t => {
+  const { store } = timeline(t);
+  const scoped = { ...config, host: { id: 'owner' }, projects: [{ id: 'p' }] };
+  const put = (id, fields = {}) => store.transaction(tx => tx.put('action', id, { version: 1, id, kind: 'artifact', owner: 'owner', projects: ['p', 'q'], artifactId: 'shared', phase: 'purged', purgeOutcome: 'complete', createdAt: base - 20, quarantinedAt: base - 10, purgedAt: base, baseline: { contents: { logicalBytes: 7 } }, ...fields }));
+  put('first'); put('second', { purgedAt: base + 1 });
+  put('before', { purgedAt: base - 1 }); put('end', { purgedAt: base + day });
+  put('other-owner', { owner: 'other' }); put('other-project', { projects: ['q'] });
+  put('pending', { phase: 'purging' }); put('interrupted', { phase: 'restored', purgeOutcome: 'interrupted' });
+  put('worktree', { kind: 'worktree' });
+  const read = () => report(scoped, store, { from: base, to: base + day, now: base + 2 * day });
+  const evidence = store.list('action');
+  assert.deepEqual(read().artifactPurges, { observedActions: 2, logicalBytes: 14, unavailableTimeActions: 0 });
+  assert.deepEqual(read().artifactPurges, read().artifactPurges);
+  assert.deepEqual(store.list('action'), evidence);
+  for (const [id, purgedAt] of [['recovered', null], ['missing', null], ['future', base + 3 * day], ['reversed', base - 11], ['invalid', 'today']]) put(id, { purgedAt });
+  store.transaction(tx => {
+    const { purgedAt, ...missing } = tx.get('action', 'missing').value;
+    tx.put('action', 'missing', missing);
+  });
+  assert.deepEqual(read().artifactPurges, { observedActions: 2, logicalBytes: 14, unavailableTimeActions: 5 });
+  assert.equal(read().reclaimedBytes, null);
+});
+
+test('purge bytes stay unavailable for missing or invalid baselines and unsafe totals', t => {
+  const { store } = timeline(t), scoped = { ...config, host: { id: 'owner' } };
+  const action = { version: 1, kind: 'artifact', owner: 'owner', projects: ['p'], phase: 'purged', purgeOutcome: 'complete', createdAt: base - 2, quarantinedAt: base - 1, purgedAt: base };
+  const read = () => report(scoped, store, { from: base, to: base + day, now: base + day }).artifactPurges;
+  assert.deepEqual(read(), { observedActions: 0, logicalBytes: 0, unavailableTimeActions: 0 });
+  for (const bytes of [undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, { toString: null }]) {
+    store.transaction(tx => tx.put('action', 'one', { ...action, baseline: { contents: bytes === undefined ? {} : { logicalBytes: bytes } } }));
+    assert.deepEqual(read(), { observedActions: 1, logicalBytes: null, unavailableTimeActions: 0 });
+  }
+  for (const bytes of [0, Number.MAX_SAFE_INTEGER]) {
+    store.transaction(tx => tx.put('action', 'one', { ...action, baseline: { contents: { logicalBytes: bytes } } }));
+    assert.equal(read().logicalBytes, bytes);
+  }
+  store.transaction(tx => tx.put('action', 'two', { ...action, baseline: { contents: { logicalBytes: 1 } } }));
+  assert.deepEqual(read(), { observedActions: 2, logicalBytes: null, unavailableTimeActions: 0 });
+});

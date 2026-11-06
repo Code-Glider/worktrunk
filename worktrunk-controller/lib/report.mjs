@@ -153,9 +153,24 @@ export function report(config, store, { from, to, now = Date.now() }) {
     const growthKnown = current && previous?.policyGeneration === config.generation && a?.identity && a.identity === b?.identity && digest(a.incarnation) === digest(b.incarnation) && Number.isSafeInteger(a.enrolledAt) && a.enrolledAt > 0 && a.enrolledAt === b.enrolledAt && a.enrolledAt <= previous.observedAt && inWindow(previous.observedAt, from, to) && inWindow(latest.observedAt, from, to) && previous.observedAt < latest.observedAt;
     return { artifactId: root.id, observedAt: latest?.observedAt ?? null, policyCurrent: Boolean(current), status: latest?.decision.status ?? 'unavailable', reasons: latest?.decision.reasons ?? ['artifact_observation_unavailable'], logicalBytes: current ? b?.contents.logicalBytes ?? null : null, growthBytes: growthKnown ? b.contents.logicalBytes - a.contents.logicalBytes : null, growthFrom: growthKnown ? previous.observedAt : null, growthTo: growthKnown ? latest.observedAt : null };
   });
+  const actions = store.list('action').map(row => row.value).filter(action => action.owner === config.host?.id && action.projects?.some(id => registered.has(id)));
+  const artifactPurges = { observedActions: 0, logicalBytes: 0, unavailableTimeActions: 0 };
+  for (const action of actions) {
+    if (action.kind !== 'artifact' || action.phase !== 'purged' || action.purgeOutcome !== 'complete') continue;
+    if (![action.createdAt, action.quarantinedAt, action.purgedAt].every(Number.isSafeInteger) || action.createdAt < 0 || action.quarantinedAt < action.createdAt || action.purgedAt < action.quarantinedAt || action.purgedAt > now) {
+      artifactPurges.unavailableTimeActions++;
+      continue;
+    }
+    if (!inWindow(action.purgedAt, from, to)) continue;
+    artifactPurges.observedActions++;
+    const bytes = action.version === 1 ? action.baseline?.contents?.logicalBytes : null;
+    const total = Number.isSafeInteger(bytes) && bytes >= 0 && artifactPurges.logicalBytes !== null ? artifactPurges.logicalBytes + bytes : null;
+    artifactPurges.logicalBytes = Number.isSafeInteger(total) ? total : null;
+  }
   return {
     version: 1, from, to, asOf: now, applyEnabled: Boolean(config.policy?.allowApply && process.platform === 'win32' && config.nativeHost), worktreeApplyEnabled: false,
-    actions: store.list('action').map(row => row.value).filter(action => action.owner === config.host?.id && action.projects?.some(id => registered.has(id))).map(action => ({ id: action.id, artifactId: action.artifactId, phase: action.phase, originalPath: action.originalPath, payloadPath: action.payloadPath, createdAt: action.createdAt, quarantinedAt: action.quarantinedAt, purgedAt: action.purgedAt ?? null, purgeOutcome: action.purgeOutcome ?? null, error: action.error })),
+    actions: actions.map(action => ({ id: action.id, artifactId: action.artifactId, phase: action.phase, originalPath: action.originalPath, payloadPath: action.payloadPath, createdAt: action.createdAt, quarantinedAt: action.quarantinedAt, purgedAt: action.purgedAt ?? null, purgeOutcome: action.purgeOutcome ?? null, error: action.error })),
+    artifactPurges,
     coverage: [...sourceMap.values()].map(source => sourceCoverage(source, allEvents)),
     unassociatedTaskEvents, unassociatedSessionEvents,
     observedFirstAcceptedTasks: acceptedTasks.length,

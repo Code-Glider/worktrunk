@@ -69,7 +69,9 @@ Artifacts stay report-only unless the owner explicitly adds `"producerAdmission"
 
 Managed `run` requires matching enrollment for every artifact root declared for its project. It reserves those roots and the checkout atomically, then rechecks every incarnation before acknowledging native launch. Shared-root cleanup conflicts block every declared project's admission. This coordination covers cooperative writers using the configured launcher; external writers remain unqualified.
 
-Reports expose the latest two artifact observations. Growth is the logical-byte difference for the same enrolled incarnation and configuration, with increasing timestamps and both samples in the report window. Missing samples, changed identity/policy and uncertain ordering yield unavailable growth. Shared roots count once across projects. Physical savings and reclaimed bytes remain unavailable.
+Reports expose the latest two artifact observations. Growth is the logical-byte difference for the same enrolled incarnation and configuration, with increasing timestamps and both samples in the report window. Missing samples, changed identity/policy and uncertain ordering yield unavailable growth. Shared roots count once across projects.
+
+`artifactPurges` counts completed artifact purge actions in the report window and sums their verified baseline `logicalBytes`. Repeated purges of the same root count as separate actions; a shared action counts once across projects. Interrupted purges contribute no completed count or bytes. Missing/invalid baseline sizes or unsafe totals make bytes unavailable. Completed actions with missing, future or contradictory timestamps appear separately as `unavailableTimeActions` across all retained history; recovery never substitutes quarantine time for an unknown purge date. These are observed contents removed, with no estimate for unrecorded cleanup. Physical savings and `reclaimedBytes` remain unavailable.
 
 ## Selected artifact quarantine and recovery
 

@@ -15,6 +15,7 @@ import { sampleClock } from '../lib/retention.mjs';
 import { fileIdentity } from '../lib/paths.mjs';
 import { producerRoots } from '../lib/artifacts.mjs';
 import { inactive, reserve } from '../lib/admission.mjs';
+import { report } from '../lib/report.mjs';
 import { controller, git, nativeWorktrunk } from './helpers.mjs';
 
 const host = process.platform === 'win32' ? nativeWorktrunk('wt-controller-host') : null;
@@ -196,7 +197,7 @@ test('purge serializes reconciliation and competing purge controllers', windows,
 test('real CLI selects a due quarantine after native elapsed retention and purges only its contents', windows, async t => {
   const s = setup(t), cli = fileURLToPath(new URL('../bin/controller.mjs', import.meta.url));
   const action = quarantineArtifact(s.config, s.store, s.decision.id);
-  const invoke = args => spawnSync(process.execPath, [cli, ...args, '--config', s.filename, '--format', 'json'], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+  const invoke = (args, format = 'json') => spawnSync(process.execPath, [cli, ...args, '--config', s.filename, '--format', format], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
   for (const args of [['purge'], ['purge', '--action', action.id], ['scan', '--action', action.id, '--project', 'myproject']]) assert.equal(invoke(args).status, 1);
   const first = invoke(['scan', '--action', action.id]); assert.equal(first.status, 0, first.stderr);
   const initial = JSON.parse(first.stdout).artifacts[0];
@@ -209,8 +210,14 @@ test('real CLI selects a due quarantine after native elapsed retention and purge
   assert.equal(invoke(['apply', '--decision', selected.id]).status, 1);
   const purged = invoke(['purge', '--decision', selected.id]); assert.equal(purged.status, 0, purged.stderr);
   assert.equal(JSON.parse(purged.stdout).phase, 'purged'); assert.deepEqual(fs.readdirSync(s.root), []);
+  const now = Date.now(), window = { from: 0, to: now, now };
+  assert.deepEqual(report(s.config, s.store, window).artifactPurges, { observedActions: 1, logicalBytes: Buffer.byteLength('reproducible content'), unavailableTimeActions: 0 });
+  assert.deepEqual(report(s.config, s.store, window).artifactPurges, report(s.config, s.store, window).artifactPurges);
   const reported = invoke(['report', '--from', '1970-01-01', '--to', '2026-01-01']); assert.equal(reported.status, 0, reported.stderr);
   assert.equal(JSON.parse(reported.stdout).actions[0].purgeOutcome, 'complete');
+  assert.deepEqual(JSON.parse(reported.stdout).artifactPurges, { observedActions: 0, logicalBytes: 0, unavailableTimeActions: 0 });
+  const text = invoke(['report', '--from', '1970-01-01', '--to', '2026-01-01'], 'text'); assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /^Artifact purges: 0 actions; 0 logical bytes; 0 actions with unavailable time$/m);
 });
 
 test('partial removal failure records error and restores only remaining contents', windows, async t => {
