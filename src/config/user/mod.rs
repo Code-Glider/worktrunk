@@ -162,6 +162,13 @@ fn parse_worktrunk_env_vars() -> Vec<EnvVar> {
         "WORKTRUNK_CONFIG_PATH",
         "WORKTRUNK_SYSTEM_CONFIG_PATH",
         "WORKTRUNK_APPROVALS_PATH",
+        "WORKTRUNK_CONTROLLER_SCRATCH",
+        "WORKTRUNK_OBSERVER_NODE",
+        "WORKTRUNK_OBSERVER_SCRIPT",
+        "WORKTRUNK_OBSERVER_CONFIG",
+        "WORKTRUNK_OBSERVER_SOURCE",
+        "WORKTRUNK_OBSERVER_PROJECT",
+        "WORKTRUNK_OBSERVER_SESSION",
     ];
 
     // `std::env::vars()` panics on any non-UTF-8 entry, including unrelated

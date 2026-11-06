@@ -997,6 +997,9 @@ pub fn collect(
     // listing with no rows at all owes the user a message rather than a silent
     // exit (see the `all_items.is_empty()` gate below).
     let worktrees: &[WorktreeInfo] = repo.list_worktrees().context("Failed to list worktrees")?;
+    for worktree in worktrees.iter().filter(|worktree| worktree.path.is_dir()) {
+        worktrunk::controller::require_callback_free(&worktree.path)?;
+    }
     // Both cells are unconditionally `set()` inside the rayon scope above, so
     // `into_inner()` is always `Some`. Use `.flatten()` rather than `.unwrap()`
     // to honor the no-unwrap rule and match the sibling cells below.
@@ -1459,6 +1462,8 @@ pub fn collect(
             items: Vec::new(),
             custom_columns,
             collected,
+            snapshot: None,
+            integration_targets: None,
         }));
     }
 
@@ -2202,6 +2207,8 @@ pub fn collect(
         items,
         custom_columns,
         collected,
+        snapshot: options.snapshot.clone(),
+        integration_targets: options.integration_targets.clone(),
     }))
 }
 

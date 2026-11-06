@@ -125,6 +125,10 @@ name = "wt"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "wt-controller-host"
+path = "worktrunk-controller/native/main.rs"
+
 # Also install as git-wt so `git wt <command>` works as a git subcommand.
 # Primarily useful on Windows where `wt` conflicts with Windows Terminal.
 # See: https://github.com/max-sixty/worktrunk/issues/133
@@ -344,6 +348,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 [target.'cfg(windows)'.dependencies]
 # The localized Documents folder that holds PowerShell profiles.
 dirs = "7.0"
+win32job = "=2.0.3"
 
 [build-dependencies]
 vergen-gitcl = { version = "10.0.0", features = ["build"] }

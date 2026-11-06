@@ -489,6 +489,27 @@
       ],
       "type": "string"
     },
+    "JsonObservation": {
+      "properties": {
+        "refs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "targets": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "refs",
+        "targets"
+      ],
+      "type": "object"
+    },
     "JsonOperation": {
       "description": "[`InProgressOperation`] wire values. The domain enum's `strum` names are\nthe same strings, but going through an exhaustive match is what makes a\nsixth variant a compile error here instead of a value that appears in\npublished output with nothing to catch it.",
       "enum": [
@@ -811,6 +832,17 @@
         "$ref": "#/$defs/JsonItemV2"
       },
       "type": "array"
+    },
+    "observation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JsonObservation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Exact ref inventory and targets used by isolated controller analysis."
     },
     "repo": {
       "$ref": "#/$defs/JsonRepo",

@@ -124,6 +124,14 @@ enum ClaudeHook {
     WorktreeRemove { worktree_path: PathBuf },
 }
 
+#[derive(serde::Deserialize)]
+struct ClaudeHookPayload {
+    #[serde(flatten)]
+    hook: ClaudeHook,
+    #[serde(default)]
+    session_id: serde_json::Value,
+}
+
 /// The fields of a `PermissionRequest` payload the approval reads. Each
 /// defaults, so a payload missing one declines rather than failing the hook.
 #[derive(serde::Deserialize)]
@@ -165,26 +173,27 @@ struct PermissionRequest {
 /// Worktree actions run this `wt` binary again with the command a user would
 /// type. Marker actions write through the discovered repository directly.
 pub fn handle_claude_hook() -> anyhow::Result<()> {
-    let hook: ClaudeHook = serde_json::from_reader(std::io::stdin().lock())
+    let payload: ClaudeHookPayload = serde_json::from_reader(std::io::stdin().lock())
         .context("Failed to parse Claude Code hook payload")?;
     let project_dir = match std::env::var_os("CLAUDE_PROJECT_DIR").filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir().context("Failed to read the current directory")?,
     };
 
-    match hook {
-        ClaudeHook::UserPromptSubmit {} => set_marker(&project_dir, Some("🤖")),
+    let session = payload.session_id.as_str().filter(|id| !id.is_empty());
+    match payload.hook {
+        ClaudeHook::UserPromptSubmit {} => set_marker(&project_dir, Some("🤖"), session),
         ClaudeHook::Notification {} | ClaudeHook::PreToolUse {} | ClaudeHook::Stop {} => {
-            set_marker(&project_dir, Some("💬"))
+            set_marker(&project_dir, Some("💬"), session)
         }
-        ClaudeHook::SessionEnd {} => set_marker(&project_dir, None),
+        ClaudeHook::SessionEnd {} => set_marker(&project_dir, None, session),
         ClaudeHook::PermissionRequest(request) => {
             // A payload `wt` can't resolve, such as a `cwd` in no repository,
             // declines, leaving the dialog.
             if approves_enter_worktree(&request).unwrap_or(false) {
                 return print_allow_decision();
             }
-            set_marker(&project_dir, Some("💬"))
+            set_marker(&project_dir, Some("💬"), session)
         }
         ClaudeHook::WorktreeCreate { name } => {
             // A directory no repository resolves from falls through to
@@ -250,7 +259,7 @@ fn print_allow_decision() -> anyhow::Result<()> {
 
 /// Sets or clears the activity marker in the session's launch worktree.
 /// Marker failures never fail a Claude hook.
-fn set_marker(dir: &Path, marker: Option<&str>) -> anyhow::Result<()> {
+fn set_marker(dir: &Path, marker: Option<&str>, session: Option<&str>) -> anyhow::Result<()> {
     let _ = (|| -> anyhow::Result<()> {
         let repo = Repository::at(dir)?;
         let Some(branch) = repo.current_worktree().branch()? else {
@@ -268,6 +277,9 @@ fn set_marker(dir: &Path, marker: Option<&str>) -> anyhow::Result<()> {
         }
         Ok(())
     })();
+    if session.is_some() {
+        super::observer::observe_marker(marker, session);
+    }
     Ok(())
 }
 

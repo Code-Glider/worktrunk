@@ -1675,6 +1675,22 @@ impl Cmd {
         };
         #[cfg(not(windows))]
         let mut cmd = Command::new(&self.program);
+        if crate::controller::active()
+            && Path::new(&self.program).file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
+            })
+        {
+            cmd.args(["-c", "core.fsmonitor=false"]);
+            if let Some(scratch) = std::env::var_os(crate::controller::SCRATCH_ENV) {
+                let hooks = Path::new(&scratch).join("hooks-disabled");
+                cmd.arg("-c")
+                    .arg(format!("core.hooksPath={}", hooks.display()));
+            }
+            cmd.env("GIT_NO_LAZY_FETCH", "1");
+            cmd.env("GIT_ALLOW_PROTOCOL", "");
+            cmd.env("GIT_OPTIONAL_LOCKS", "0");
+        }
         cmd.args(&self.args);
         cmd
     }
