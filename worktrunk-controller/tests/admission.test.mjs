@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { Store } from '../lib/store.mjs';
 import { acquireCleanup, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
 import { child, fixture } from './helpers.mjs';
+import { fileIdentity } from '../lib/paths.mjs';
 
 function setup(t) {
   let store;
@@ -82,4 +83,66 @@ test('a moved child cleanup claim blocks admission to its new parent and unrelat
   fs.renameSync(original, path.join(other, 'child'));
   assert.throws(() => reserve(s.store, { roots: [other], owner: 'host', sessionId: 'one' }), /Cleanup/);
   assert.throws(() => reserve(s.store, { roots: [s.root], owner: 'host', sessionId: 'two' }), /Cleanup/);
+});
+
+test('cleanup claim and linked intent either commit together or both roll back', t => {
+  const s = setup(t);
+  s.store.db.exec("CREATE TRIGGER fail_intent BEFORE INSERT ON records WHEN NEW.kind='action' BEGIN SELECT RAISE(ABORT,'intent failed'); END;");
+  assert.throws(() => acquireCleanup(s.store, { roots: [s.root], owner: 'host', actionId: 'one' }, (tx, claim) => {
+    tx.put('action', 'one', { version: 1, claimToken: claim.token });
+  }), /intent failed/);
+  assert.equal(s.store.list('claim').length, 0);
+  assert.equal(s.store.list('action').length, 0);
+  assert.throws(() => acquireCleanup(s.store, { roots: [s.root], owner: 'host' }, async () => {}), /synchronous/);
+  assert.equal(s.store.list('claim').length, 0);
+});
+
+test('linked intent reserves its future container against earlier and later parent producers', t => {
+  for (const first of ['producer', 'cleanup']) {
+    const s = setup(t), parent = path.join(s.base, 'quarantine'); fs.mkdirSync(parent);
+    const containerPath = path.join(parent, 'future'), payloadPath = path.join(containerPath, 'payload');
+    const producer = () => reserve(s.store, { roots: [parent], owner: 'host', sessionId: 'writer' });
+    const cleanup = () => acquireCleanup(s.store, { roots: [s.root], owner: 'host', actionId: 'one' }, (tx, claim) => {
+      tx.put('action', 'one', { version: 1, id: 'one', claimToken: claim.token, owner: claim.owner, originalPath: s.root, originalParent: fileIdentity(s.base), incarnation: fileIdentity(s.root), containerPath, containerIdentity: null, payloadPath, phase: 'intent' });
+    });
+    if (first === 'producer') {
+      producer(); assert.throws(cleanup, /owner|claim/);
+      assert.equal(s.store.list('action').length, 0);
+      assert.equal(s.store.list('claim').length, 1);
+    } else {
+      const claim = cleanup(); assert.throws(producer, /Cleanup/);
+      assert.equal(inactive(s.store, s.root, claim.token), true);
+    }
+    assert.equal(fs.existsSync(containerPath), false);
+  }
+});
+
+test('only a bound journaled relocation fences the original and payload without blocking unrelated roots', t => {
+  const s = setup(t), containerPath = path.join(s.base, 'container'), other = path.join(s.base, 'other');
+  fs.mkdirSync(containerPath); fs.mkdirSync(other);
+  const payloadPath = path.join(containerPath, 'payload');
+  let action;
+  const claim = acquireCleanup(s.store, { roots: [s.root], owner: 'host', actionId: 'one' }, (tx, claim) => {
+    action = { version: 1, id: 'one', claimToken: claim.token, owner: claim.owner, originalPath: s.root, originalParent: fileIdentity(s.base), incarnation: fileIdentity(s.root), containerPath, containerIdentity: fileIdentity(containerPath), payloadPath, phase: 'prepared' };
+    tx.put('action', action.id, action);
+  });
+  assert.equal(inactive(s.store, s.root), false);
+  assert.equal(inactive(s.store, s.root, claim.token), true);
+  assert.throws(() => inactive(s.store, s.root, 'wrong-token'), /Own cleanup claim/);
+  assert.throws(() => releaseCleanup(s.store, claim.token), /verified action recovery/);
+  reserve(s.store, { roots: [other], owner: 'host', sessionId: 'other-owner' });
+  fs.renameSync(other, path.join(s.base, 'moved-producer'));
+  assert.equal(inactive(s.store, s.root, claim.token), false);
+  fs.renameSync(path.join(s.base, 'moved-producer'), other);
+  fs.renameSync(s.root, payloadPath);
+  assert.throws(() => reserve(s.store, { roots: [other], owner: 'host', sessionId: 'unknown-move' }), /Cleanup/);
+  s.store.transaction(tx => {
+    tx.put('action', action.id, { ...action, phase: 'quarantined' });
+    tx.put('claim', claim.token, { ...claim, roots: [{ ...claim.roots[0], currentPath: payloadPath }] });
+  });
+  assert.equal(reserve(s.store, { roots: [other], owner: 'host', sessionId: 'unrelated' }).state, 'reserved');
+  fs.mkdirSync(s.root);
+  for (const root of [s.root, payloadPath, containerPath]) assert.throws(() => reserve(s.store, { roots: [root], owner: 'host', sessionId: 'blocked' }), /Cleanup/);
+  fs.renameSync(containerPath, path.join(s.base, 'moved-container')); fs.mkdirSync(containerPath);
+  assert.throws(() => reserve(s.store, { roots: [other], owner: 'host', sessionId: 'substituted' }), /Cleanup/);
 });

@@ -50,7 +50,7 @@ function classification(artifact, relative) {
   return matches.find(rule => rule.kind !== 'reproducible_cache')?.kind ?? matches[0]?.kind ?? 'unknown';
 }
 
-export function inspectArtifact(config, store, artifactId, now = Date.now()) {
+export function inspectArtifact(config, store, artifactId, now = Date.now(), ownCleanupToken) {
   const artifact = configured(config, artifactId);
   const target = { kind: 'artifact', artifactId, path: artifact.path, projects: artifact.projects };
   let decision;
@@ -67,7 +67,7 @@ export function inspectArtifact(config, store, artifactId, now = Date.now()) {
       identity: enrolled?.id ?? null, incarnation: before, enrolledAt: enrolled?.enrolledAt ?? null,
       ownerMatches: artifact.owner === config.host.id, managedOnly: artifact.managedOnly,
       admissionContract: artifact.producerAdmission ?? null, nativeHost,
-      producerAdmission: nativeHost !== null, inactiveProducers: inactive(store, root),
+      producerAdmission: nativeHost !== null, inactiveProducers: inactive(store, root, ownCleanupToken),
       protectedPath: [config.stateDir, config.quarantineDir, fileURLToPath(new URL('../', import.meta.url))].some(protectedRoot => overlap(root, protectedRoot)) || within(root, process.cwd()),
       classes, contents, links: contents.links, nested: contents.nested,
     };

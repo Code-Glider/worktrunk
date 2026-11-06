@@ -9,12 +9,31 @@ function roots(paths) {
   return result;
 }
 
-function conflicts(tx, targets, cleanup) {
+function fences(tx, claim, root) {
+  const result = [root.path];
+  if (claim.actionId) {
+    const action = tx.get('action', claim.actionId)?.value;
+    if (claim.kind !== 'cleanup' || claim.roots.length !== 1 || !action || action.id !== claim.actionId || action.claimToken !== claim.token || action.owner !== claim.owner || action.originalPath !== root.path || digest(action.incarnation) !== digest(root.incarnation)) throw new Error('Cleanup action binding unavailable');
+    if (digest(fileIdentity(path.dirname(root.path))) !== digest(action.originalParent)) throw new Error('Cleanup parent changed');
+    const containerPath = localPath(action.containerPath, { missing: true });
+    result.push(containerPath);
+    if (action.containerIdentity) {
+      if (digest(fileIdentity(containerPath)) !== digest(action.containerIdentity)) throw new Error('Cleanup container changed');
+    } else if (fs.existsSync(containerPath)) throw new Error('Cleanup container is unverified');
+    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['quarantined', 'restoring'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
+  } else if (root.currentPath) throw new Error('Cleanup relocation has no action');
+  if (digest(fileIdentity(root.currentPath ?? root.path)) !== digest(root.incarnation)) throw new Error('Claim incarnation changed');
+  return result;
+}
+
+function conflicts(tx, targets, cleanup, ownToken) {
   return tx.list('claim').some(({ value }) => value.state !== 'released' && value.state !== 'ended' && (cleanup || value.kind === 'cleanup') && value.roots.some(root => {
-    // A moved/missing root has unknown ancestry; its old path cannot fence cleanup.
-    try { if (digest(fileIdentity(root.path)) !== digest(root.incarnation)) return true; }
+    // Only a journaled move has known ancestry; unexplained movement blocks globally.
+    let paths;
+    try { paths = fences(tx, value, root); }
     catch { return true; }
-    return targets.some(target => overlap(root.path, target.path));
+    if (value.token === ownToken) return false;
+    return paths.some(path => targets.some(target => overlap(path, target.path)));
   }));
 }
 
@@ -45,13 +64,17 @@ export function transition(store, token, expected, next, nativeEvidence) {
   });
 }
 
-export function acquireCleanup(store, request) {
+export function acquireCleanup(store, request, onAcquire = () => {}) {
   const targets = roots(request.roots), owner = text(request.owner, 'owner');
   return store.transaction(tx => {
     if (conflicts(tx, targets, true)) throw new Error('Active or unresolved owner/cleanup claim');
     const token = randomUUID();
     const record = { version: 1, token, kind: 'cleanup', state: 'held', owner, roots: targets };
+    if (request.actionId !== undefined) record.actionId = text(request.actionId, 'action ID');
     tx.put('claim', token, record);
+    if (onAcquire(tx, record)?.then) throw new Error('Cleanup intent callback must be synchronous');
+    const fenced = targets.flatMap(root => fences(tx, record, root).map(path => ({ path })));
+    if (conflicts(tx, fenced, true, token)) throw new Error('Active or unresolved owner/cleanup claim');
     return record;
   });
 }
@@ -60,11 +83,20 @@ export function releaseCleanup(store, token) {
   return store.transaction(tx => {
     const record = tx.get('claim', text(token, 'claim token'))?.value;
     if (!record || record.kind !== 'cleanup' || record.state !== 'held') throw new Error('Cleanup claim is not held');
+    if (record.actionId) throw new Error('Action cleanup claims require verified action recovery');
     tx.put('claim', token, { ...record, state: 'released' });
   });
 }
 
-export function inactive(store, root) {
+export function inactive(store, root, ownCleanupToken) {
   const targets = roots([root]);
-  return !conflicts(store, targets, true);
+  if (ownCleanupToken !== undefined) {
+    const claim = store.get('claim', ownCleanupToken)?.value;
+    const action = claim?.actionId && store.get('action', claim.actionId)?.value;
+    if (!claim || claim.kind !== 'cleanup' || claim.state !== 'held' || claim.roots.length !== 1 || claim.roots[0].path !== targets[0].path || claim.roots[0].currentPath || !action || !['intent', 'prepared'].includes(action.phase)) throw new Error('Own cleanup claim does not match action');
+    fences(store, claim, claim.roots[0]);
+  }
+  return !conflicts(store, targets, true, ownCleanupToken);
 }
+import fs from 'node:fs';
+import path from 'node:path';
