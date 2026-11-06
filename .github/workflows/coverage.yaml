@@ -31,6 +31,12 @@ jobs:
     steps:
     - name: 📂 Checkout code
       uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24.15.0
 
     - uses: baptiste0928/cargo-install@v3
       with:
@@ -64,7 +70,14 @@ jobs:
     - name: 📊 Generate coverage report
       # Match the regular suite's process isolation. Cargo's in-process runner
       # lets one busy PTY test delay another before it can paint its prompt.
-      run: cargo llvm-cov nextest --features shell-integration-tests --cobertura --output-path=cobertura.xml
+      run: |
+        cargo llvm-cov nextest --features shell-integration-tests --no-report
+        # The controller's Node harness drives real Rust subprocesses.
+        export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
+        source <(cargo llvm-cov show-env --sh)
+        cargo build --locked --bin wt --bin wt-controller-host
+        node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
+        cargo llvm-cov report --cobertura --output-path=cobertura.xml
 
     - name: Upload code coverage results
       uses: actions/upload-artifact@v7
