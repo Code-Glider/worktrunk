@@ -33,6 +33,26 @@ node worktrunk-controller/bin/controller.mjs enroll --config <absolute-config.js
 
 Each inventory item has a decision ID, status and reasons. Logical bytes describe checkout content; estimated physical savings remain unavailable. Ignored/untracked files, hidden index entries, links, nested repositories, user locks, primary/default checkouts, unknown age and protected paths veto eligibility. Assume-unchanged and skip-worktree flags make cleanliness unknown. Missing task authority and producer admission currently retain every otherwise clean candidate. A failed probe produces `analysis_failed`, keeps the data and makes the CLI exit nonzero.
 
+## Artifact roots
+
+Artifact roots are explicit configuration, including owner, registered projects, a managed-producer declaration and retention. Declare a shared root once with every project that writes it. Roots cannot overlap each other, state, quarantine, controller code or other protected paths. For example:
+
+```json
+{"id":"build-cache","path":"C:/agent-cache/project","owner":"your-host-id","projects":["registered-project-id"],"managedOnly":true,"retentionMs":604800000,"classes":[{"path":".","kind":"reproducible_cache"},{"path":"evidence","kind":"evidence"}]}
+```
+
+Class paths are literal relative slash paths, not globs. Supported kinds are `reproducible_cache`, `configuration`, `credentials`, `evidence` and `unknown`; omitted paths default to unknown. Cache declarations require the owner's reproducibility guarantee. Protected ancestor rules and known agent configuration/credential names veto cache classification. These name checks are conservative safeguards, not a general secret detector. Ignoring a file or giving it an old modification time grants no disposal permission.
+
+```console
+node worktrunk-controller/bin/controller.mjs enroll-artifact --config <absolute-config.json> --artifact build-cache
+```
+
+Enrollment records the existing directory's native incarnation in SQLite without writing inside it. Recreated directories, owner/project binding changes and missing enrollment require explicit repair; scans never adopt them. Scans include configured artifacts, ignored files and Git metadata, preserve mixed/unknown roots and report logical bytes. Artifact cleanup remains retained pending full mutation/admission qualification.
+
+Managed `run` requires matching enrollment for every artifact root declared for its project. It reserves those roots and the checkout atomically, then rechecks every incarnation before acknowledging native launch. Shared-root cleanup conflicts block every declared project's admission. This coordination covers cooperative writers using the configured launcher; external writers remain unqualified.
+
+Reports expose the latest two artifact observations. Growth is the logical-byte difference for the same enrolled incarnation and configuration, with increasing timestamps and both samples in the report window. Missing samples, changed identity/policy and uncertain ordering yield unavailable growth. Shared roots count once across projects. Physical savings and reclaimed bytes remain unavailable.
+
 ## Observation boundary
 
 The controller removes inherited Git and Worktrunk overrides, directives and tracing destinations, uses private user/system configuration, disables project display configuration, and bounds child commands and file inventories. It verifies the executable hash before and after invocation. Native Worktrunk uses invocation-private indexes and object storage, skips the shared temporary-index sweep and fallback, suppresses fsmonitor and Git hooks, disables transports/lazy fetch, and refuses configured filters, merge drivers and diff callbacks. Submodule observations are unavailable pending qualification.
@@ -86,7 +106,7 @@ node worktrunk-controller/bin/controller.mjs report --config <absolute-config.js
 
 The report's UTC end date is exclusive and cannot be in the future. Task event types are `task_started`, `attempt_started`, `attempt_accepted`, `attempt_failed`, `attempt_cancelled`, `task_reopened` and `task_revoked`. Host types are `session_started`, `working`, `waiting`, `session_ended` and `association`. Either source may send an independent `checkpoint` with `fromSequence`/`throughSequence` to expose gaps; checkpoints do not occupy an event sequence. Coverage remains partial and unmeasured even when a declared range is complete.
 
-Reports count each task's first observed acceptance once, by Monday UTC week and authority/project/task identity. Cancellations remain in the first-attempt denominator. Median/p95 durations use accepted tasks with known start/end times; missing or inconsistent timing is unavailable. Attribution counts one team task and keeps multiple contributors separate from single-agent counts. Sessions are independent across source instances and session IDs, including when they share a branch. Waiting/working intervals and overlap are observed samples, not process liveness or a utilization estimate. Artifact growth, reclaimed bytes and usage remain unavailable.
+Reports count each task's first observed acceptance once, by Monday UTC week and authority/project/task identity. Cancellations remain in the first-attempt denominator. Median/p95 durations use accepted tasks with known start/end times; missing or inconsistent timing is unavailable. Attribution counts one team task and keeps multiple contributors separate from single-agent counts. Sessions are independent across source instances and session IDs, including when they share a branch. Waiting/working intervals and overlap are observed samples, not process liveness or a utilization estimate. Reclaimed bytes and usage remain unavailable.
 
 `report` requires existing state and opens SQLite read-only; it never initializes a database. Conflicting simultaneous session states without source ordering and known source-sequence gaps across intervals make session durations and overlap unavailable. Sequences belong to the entire source, so known events from another session or project fill their sequence positions. State-only events preserve the last explicit repository/worktree association.
 

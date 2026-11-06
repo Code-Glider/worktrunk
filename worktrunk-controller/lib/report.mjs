@@ -145,6 +145,14 @@ export function report(config, store, { from, to, now = Date.now() }) {
   const sourceMap = new Map(store.list('event_source').map(row => [row.value.source.instance, row.value.source]));
   for (const source of config.eventSources) sourceMap.set(source.instance, source);
   const scans = store.list('scan').filter(row => registered.has(row.id)).map(row => row.value);
+  const artifactScans = new Map(store.list('artifact_scan').map(row => [row.id, row.value]));
+  const artifacts = (config.artifactRoots ?? []).filter(root => root.projects.some(id => registered.has(id))).map(root => {
+    const latest = artifactScans.get(root.id), previous = latest?.previous;
+    const current = latest?.policyGeneration === config.generation;
+    const a = previous?.decision.evidence, b = latest?.decision.evidence;
+    const growthKnown = current && previous?.policyGeneration === config.generation && a?.identity && a.identity === b?.identity && digest(a.incarnation) === digest(b.incarnation) && Number.isSafeInteger(a.enrolledAt) && a.enrolledAt > 0 && a.enrolledAt === b.enrolledAt && a.enrolledAt <= previous.observedAt && inWindow(previous.observedAt, from, to) && inWindow(latest.observedAt, from, to) && previous.observedAt < latest.observedAt;
+    return { artifactId: root.id, observedAt: latest?.observedAt ?? null, policyCurrent: Boolean(current), status: latest?.decision.status ?? 'unavailable', reasons: latest?.decision.reasons ?? ['artifact_observation_unavailable'], logicalBytes: current ? b?.contents.logicalBytes ?? null : null, growthBytes: growthKnown ? b.contents.logicalBytes - a.contents.logicalBytes : null, growthFrom: growthKnown ? previous.observedAt : null, growthTo: growthKnown ? latest.observedAt : null };
+  });
   return {
     version: 1, from, to, asOf: now, applyEnabled: false,
     coverage: [...sourceMap.values()].map(source => sourceCoverage(source, allEvents)),
@@ -156,7 +164,7 @@ export function report(config, store, { from, to, now = Date.now() }) {
     observedReopens: events.filter(event => event.type === 'task_reopened' && inWindow(event.at, from, to)).length,
     observedRevocations: events.filter(event => event.type === 'task_revoked' && inWindow(event.at, from, to)).length,
     backlog: scans.map(scan => ({ project: scan.project, observedAt: scan.observedAt ?? null, policyCurrent: scan.policyGeneration === config.generation, worktrees: scan.decisions.length, retained: scan.decisions.filter(item => item.status === 'retain').length, analysisFailed: scan.decisions.filter(item => item.status === 'analysis_failed').length, reasons: scan.decisions.flatMap(item => item.reasons) })),
-    artifactGrowthBytes: null, reclaimedBytes: null, usage: null,
+    artifacts, artifactGrowthBytes: artifacts.length && artifacts.every(root => root.growthBytes !== null) ? artifacts.reduce((total, root) => total + root.growthBytes, 0) : null, reclaimedBytes: null, usage: null,
     tasks, sessions, concurrency,
   };
 }

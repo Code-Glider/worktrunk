@@ -21,3 +21,19 @@ export function decideWorktree(facts, policy, now) {
   if (!facts.inactiveProducers) reasons.push('producer_admission_unavailable');
   return { status: reasons.length ? 'retain' : 'eligible', reasons };
 }
+
+export function decideArtifact(facts, policy, now) {
+  const reasons = [];
+  if (!facts.identity) reasons.push('unmanaged_incarnation');
+  if (!facts.ownerMatches) reasons.push('artifact_owner_mismatch');
+  if (!facts.managedOnly || !facts.producerAdmission) reasons.push('producer_admission_unqualified');
+  if (!facts.inactiveProducers) reasons.push('active_or_unresolved_producers');
+  if (facts.protectedPath) reasons.push('protected_path');
+  if (facts.links) reasons.push('link_content');
+  if (facts.nested) reasons.push('nested_repository');
+  for (const kind of ['configuration', 'credentials', 'evidence', 'unknown']) if (facts.classes?.[kind] > 0) reasons.push(`artifact_${kind}`);
+  if (!facts.enrolledAt || now < facts.enrolledAt) reasons.push('age_unknown');
+  else if (now - facts.enrolledAt < policy.minAgeMs) reasons.push('too_young');
+  if (['ownerMatches', 'managedOnly', 'producerAdmission', 'inactiveProducers', 'protectedPath', 'links', 'nested'].some(key => typeof facts[key] !== 'boolean') || !facts.classes || ['reproducible_cache', 'configuration', 'credentials', 'evidence', 'unknown'].some(kind => !Number.isSafeInteger(facts.classes[kind]) || facts.classes[kind] < 0)) reasons.push('facts_incomplete');
+  return { status: reasons.length ? 'retain' : 'eligible', reasons };
+}

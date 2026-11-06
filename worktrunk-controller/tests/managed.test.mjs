@@ -8,7 +8,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../lib/store.mjs';
-import { acquireCleanup, inactive } from '../lib/admission.mjs';
+import { acquireCleanup, inactive, releaseCleanup } from '../lib/admission.mjs';
+import { enrollArtifact } from '../lib/artifacts.mjs';
 import { runManaged } from '../lib/managed.mjs';
 import { controller, fixture, nativeWorktrunk } from './helpers.mjs';
 
@@ -93,6 +94,42 @@ test('native command spawn failure leaves ownership unresolved', { skip: process
   await assert.rejects(runManaged(s.config, s.store, { root: s.root, sessionId: 'invalid-program', program, args: [] }), /completion unavailable/);
   assert.equal(s.store.list('claim')[0].value.state, 'unresolved');
   assert.equal(inactive(s.store, s.root), false);
+});
+
+test('native launch reserves a shared artifact root before either project starts writing', { skip: process.platform !== 'win32' }, async t => {
+  const s = setup(t), root = path.join(s.root, 'checkout'), cache = path.join(s.root, 'shared-cache');
+  fs.mkdirSync(root); fs.mkdirSync(cache);
+  s.config.artifactRoots = [{ id: 'shared', path: cache, owner: s.config.host.id, projects: ['one', 'two'], managedOnly: true, retentionMs: 1000, classes: [] }];
+  const ready = path.join(cache, 'ready'), gate = path.join(cache, 'gate');
+  const request = { root, projectId: 'one', sessionId: 'one', program: process.execPath, args: ['-e', `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)},'writing');const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)}))clearInterval(timer);},20);`] };
+  await assert.rejects(runManaged(s.config, s.store, request), /enrollment/);
+  assert.equal(fs.existsSync(ready), false);
+  enrollArtifact(s.config, s.store, 'shared');
+  const cleanup = acquireCleanup(s.store, { owner: 'cleanup', roots: [cache] });
+  await assert.rejects(runManaged(s.config, s.store, { ...request, projectId: 'two' }), /Cleanup/);
+  assert.equal(fs.existsSync(ready), false); assert.equal(s.store.list('claim').length, 1);
+  releaseCleanup(s.store, cleanup.token);
+  const running = runManaged(s.config, s.store, request); running.catch(() => {});
+  try {
+    await until(() => fs.existsSync(ready));
+    const admitted = s.store.list('claim').find(row => row.value.kind === 'producer').value;
+    assert.deepEqual(admitted.roots.map(root => root.path), [root, cache]);
+    assert.throws(() => acquireCleanup(s.store, { owner: 'cleanup', roots: [cache] }), /owner/);
+    assert.equal(inactive(s.store, cache), false);
+  } finally { fs.writeFileSync(gate, 'finished'); await running; }
+  assert.equal(inactive(s.store, cache), true);
+});
+
+test('artifact recreation after reservation prevents native launch acknowledgement', { skip: process.platform !== 'win32' }, async t => {
+  const s = setup(t), root = path.join(s.root, 'checkout'), cache = path.join(s.root, 'cache'), sentinel = path.join(root, 'never');
+  fs.mkdirSync(root); fs.mkdirSync(cache);
+  s.config.artifactRoots = [{ id: 'cache', path: cache, owner: s.config.host.id, projects: ['one'], managedOnly: true, retentionMs: 1000, classes: [] }];
+  enrollArtifact(s.config, s.store, 'cache');
+  const starting = runManaged(s.config, s.store, { root, projectId: 'one', sessionId: 'one', program: process.execPath, args: ['-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)},'bad')`] });
+  fs.renameSync(cache, path.join(s.root, 'retained-cache')); fs.mkdirSync(cache);
+  await assert.rejects(starting, /matching ownership|incarnation changed/);
+  assert.equal(fs.existsSync(sentinel), false);
+  assert.equal(s.store.list('claim')[0].value.state, 'unresolved');
 });
 
 test('failed completion commit never releases a finished producer claim', { skip: process.platform !== 'win32' }, async t => {

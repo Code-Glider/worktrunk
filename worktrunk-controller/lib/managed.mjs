@@ -5,8 +5,9 @@ import { createInterface } from 'node:readline';
 import { digest, text } from './data.mjs';
 import { fileIdentity, localPath } from './paths.mjs';
 import { reserve, transition } from './admission.mjs';
+import { producerRoots } from './artifacts.mjs';
 
-export async function runManaged(config, store, { root, sessionId, program, args }) {
+export async function runManaged(config, store, { root, projectId, sessionId, program, args }) {
   if (process.platform !== 'win32' || !config.nativeHost) throw new Error('Qualified native Windows lifetime host required');
   root = localPath(root); program = localPath(program); text(sessionId, 'sessionId');
   if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string' || arg.includes('\0'))) throw new Error('Invalid managed command arguments');
@@ -15,7 +16,7 @@ export async function runManaged(config, store, { root, sessionId, program, args
   if (hash() !== config.nativeHost.sha256) throw new Error('Native host executable hash changed');
   const version = spawnSync(host, ['--version'], { windowsHide: true, encoding: 'utf8', timeout: config.limits.timeoutMs });
   if (version.status !== 0 || version.stdout.trim() !== 'wt-controller-host 1') throw new Error('Unsupported native host protocol');
-  const claim = reserve(store, { roots: [root], sessionId, owner: config.host.id });
+  const claim = reserve(store, { roots: producerRoots(config, store, projectId, root), sessionId, owner: config.host.id });
   transition(store, claim.token, 'reserved', 'starting');
   let phase = 'starting', result;
   const child = spawn(host, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'inherit'] });
@@ -31,7 +32,7 @@ export async function runManaged(config, store, { root, sessionId, program, args
       const message = JSON.parse(line);
       if (message.version !== 1 || message.evidence?.helperPid !== child.pid || message.evidence?.launchToken !== claim.token) throw new Error('Native lifetime response mismatch');
       if (message.type === 'contained' && phase === 'starting' && message.evidence.activeProcesses === null) {
-        if (digest(fileIdentity(root)) !== digest(claim.roots[0].incarnation)) throw new Error('Managed root incarnation changed before launch');
+        if (digest(producerRoots(config, store, projectId, root)) !== digest(claim.roots.map(root => root.path)) || claim.roots.some(root => digest(fileIdentity(root.path)) !== digest(root.incarnation))) throw new Error('Managed root incarnation changed before launch');
         if (digest(identity) !== digest(fileIdentity(host)) || hash() !== config.nativeHost.sha256) throw new Error('Native host executable changed before launch');
         transition(store, claim.token, phase, 'running', message.evidence);
         phase = 'running';

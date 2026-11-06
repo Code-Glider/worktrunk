@@ -44,6 +44,31 @@ test('native lifetime host is optional but must declare a pinned supported proto
   s.config.nativeHost.version = 2; assert.throws(s.load, /unpinned native host/);
 });
 
+test('artifact roots require explicit ownership, literal classes and separate protected boundaries', t => {
+  const s = setup(t), root = path.join(s.base, 'cache');
+  fs.mkdirSync(root);
+  const artifact = { id: 'cache', path: root, owner: 'test-host', projects: ['myproject'], managedOnly: true, retentionMs: 1000, classes: [{ path: '.', kind: 'reproducible_cache' }, { path: '.archon', kind: 'configuration' }] };
+  s.config.artifactRoots = [artifact];
+  const valid = s.load(); assert.equal(valid.artifactRoots[0].path, root);
+  const helper = path.join(root, 'lifetime-host'); fs.writeFileSync(helper, 'pinned helper');
+  s.config.nativeHost = { path: helper, sha256: 'a'.repeat(64), version: 1 }; assert.throws(s.load, /protected native host/); delete s.config.nativeHost;
+  for (const relative of ['../outside', '/absolute', 'cache\\outside', 'C:outside', 'cache/*', 'cache//child']) {
+    artifact.classes[0].path = relative; assert.throws(s.load, /literal relative/);
+  }
+  artifact.classes[0].path = '.';
+  artifact.managedOnly = undefined; assert.throws(s.load, /managedOnly/); artifact.managedOnly = true;
+  artifact.projects = ['missing']; assert.throws(s.load, /registered/); artifact.projects = ['myproject'];
+  artifact.path = s.config.stateDir; assert.throws(s.load, /protected/);
+  artifact.path = s.root; assert.throws(s.load, /protected/);
+  artifact.path = root;
+  s.config.artifactRoots.push({ ...artifact, id: 'duplicate-root' }); assert.throws(s.load, /must not overlap/);
+  s.config.artifactRoots.pop();
+  artifact.classes.push({ path: '.', kind: 'unknown' }); assert.throws(s.load, /duplicate artifact class/); artifact.classes.pop();
+  artifact.classes[0].kind = 'configuration'; assert.notEqual(s.load().generation, valid.generation);
+  const link = path.join(s.base, 'linked-cache'); fs.symlinkSync(root, link, process.platform === 'win32' ? 'junction' : 'dir');
+  artifact.path = link; assert.throws(s.load, /Link traversal/);
+});
+
 test('duplicate registry IDs and state under a project are rejected', t => {
   const s = setup(t);
   fs.writeFileSync(s.registry, JSON.stringify({ version: 1, projects: [{ id: 'same', root: './myproject' }, { id: 'same', root: './myproject' }] }));
@@ -80,4 +105,21 @@ test('optional paths may disappear after lstat without hiding links or required-
   assert.equal(localPath(filename, { missing: true }), filename);
   fs.writeFileSync(filename, 'journal');
   assert.throws(() => localPath(filename), { code: 'ENOENT' });
+});
+
+test('optional Windows UNKNOWN resolution requires independently confirmed disappearance', t => {
+  const s = setup(t), filename = path.join(s.base, 'transient-journal');
+  const native = fs.realpathSync.native;
+  let disappear = false;
+  t.mock.method(fs.realpathSync, 'native', value => {
+    if (value !== filename) return native(value);
+    if (disappear) fs.unlinkSync(filename);
+    throw Object.assign(new Error('Windows journal resolution failed'), { code: 'UNKNOWN' });
+  });
+  fs.writeFileSync(filename, 'journal');
+  assert.throws(() => localPath(filename, { missing: true }), { code: 'UNKNOWN' });
+  disappear = true;
+  assert.equal(localPath(filename, { missing: true }), filename);
+  fs.writeFileSync(filename, 'journal');
+  assert.throws(() => localPath(filename), { code: 'UNKNOWN' });
 });

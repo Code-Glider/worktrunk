@@ -11,16 +11,17 @@ import { decideWorktree } from './policy.mjs';
 const integrationReasons = new Set(['same_commit', 'ancestor', 'trees_match', 'no_added_changes', 'merge_adds_nothing', 'patch_id_match']);
 const codeRoot = fileURLToPath(new URL('../', import.meta.url));
 
-export function inventoryContents(root, limits) {
+export function inventoryContents(root, limits, { skipGit = true, visitEntry = () => {} } = {}) {
   let files = 0, bytes = 0, nested = false, links = false;
   const entries = [];
   function visit(directory, relative = '') {
     for (const name of fs.readdirSync(directory).sort()) {
       const child = path.join(directory, name);
       const key = path.join(relative, name);
-      if (!relative && name === '.git') continue;
+      if (skipGit && !relative && name === '.git') continue;
       if (++files > limits.maxFiles) throw new Error('Content inventory exceeds file limit');
       const stat = fs.lstatSync(child, { bigint: true });
+      visitEntry(key, stat);
       if (name === '.git') nested = true;
       if (stat.isSymbolicLink()) { links = true; entries.push([key, 'link']); }
       else if (stat.isDirectory()) { entries.push([key, 'directory']); visit(child, key); }
@@ -29,7 +30,20 @@ export function inventoryContents(root, limits) {
         bytes += size;
         if (!Number.isSafeInteger(bytes) || bytes > limits.maxBytes) throw new Error('Content inventory exceeds byte limit');
         const before = fileIdentity(child);
-        const hash = createHash('sha256').update(fs.readFileSync(child)).digest('hex');
+        const unchanged = next => ['dev', 'ino', 'birthtimeNs', 'size', 'mtimeNs', 'ctimeNs'].every(key => stat[key] === next[key]);
+        const fd = fs.openSync(child, 'r'), hasher = createHash('sha256');
+        try {
+          if (!unchanged(fs.fstatSync(fd, { bigint: true }))) throw new Error('Content changed during inventory');
+          const buffer = Buffer.alloc(Math.min(size, 65536));
+          let read = 0;
+          while (read < size) {
+            const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - read), null);
+            if (!count) throw new Error('Content changed during inventory');
+            hasher.update(buffer.subarray(0, count)); read += count;
+          }
+          if (!unchanged(fs.fstatSync(fd, { bigint: true }))) throw new Error('Content changed during inventory');
+        } finally { fs.closeSync(fd); }
+        const hash = hasher.digest('hex');
         const after = fs.lstatSync(child, { bigint: true });
         if (digest(before) !== digest(fileIdentity(child)) || stat.size !== after.size || stat.mtimeNs !== after.mtimeNs || stat.ctimeNs !== after.ctimeNs) throw new Error('Content changed during inventory');
         entries.push([key, 'file', size, hash]);

@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { digest, integer, object, text } from './data.mjs';
-import { localPath, overlap } from './paths.mjs';
+import { localPath, overlap, within } from './paths.mjs';
 
 export function loadConfig(filename) {
   const value = object(JSON.parse(fs.readFileSync(localPath(filename), 'utf8')), 'configuration');
@@ -37,14 +38,42 @@ export function loadConfig(filename) {
   if (typeof policy.allowApply !== 'boolean' || typeof policy.deleteBranches !== 'boolean') throw new Error('Explicit apply/branch policy required');
   const limits = object(value.limits, 'limits');
   for (const key of ['timeoutMs', 'maxFiles', 'maxBytes']) integer(limits[key], `limits.${key}`, 1);
-  const artifactRoots = value.artifactRoots ?? [];
-  if (!Array.isArray(artifactRoots)) throw new Error('artifactRoots must be an array');
+  if (value.artifactRoots !== undefined && !Array.isArray(value.artifactRoots)) throw new Error('artifactRoots must be an array');
+  const artifactIds = new Set();
+  const artifactRoots = (value.artifactRoots ?? []).map(artifact => {
+    object(artifact, 'artifact root');
+    if (Object.keys(artifact).some(key => !['id', 'path', 'owner', 'projects', 'managedOnly', 'retentionMs', 'classes'].includes(key))) throw new Error('Unknown artifact root field');
+    const id = text(artifact.id, 'artifact.id'), owner = text(artifact.owner, 'artifact.owner');
+    if (artifactIds.has(id)) throw new Error('Duplicate artifact ID');
+    artifactIds.add(id);
+    const root = localPath(artifact.path, { missing: true });
+    const protectedPaths = [stateDir, quarantineDir, executable, registryPath, localPath(filename), fileURLToPath(new URL('../', import.meta.url))];
+    if (protectedPaths.some(protectedRoot => overlap(root, protectedRoot)) || within(root, process.cwd()) || projects.some(project => within(root, project.root))) throw new Error('Artifact root overlaps protected paths');
+    if (!Array.isArray(artifact.projects) || !artifact.projects.length || artifact.projects.some(id => !ids.has(id)) || new Set(artifact.projects).size !== artifact.projects.length) throw new Error('Artifact projects must be registered and unique');
+    if (typeof artifact.managedOnly !== 'boolean') throw new Error('Artifact managedOnly must be explicit');
+    integer(artifact.retentionMs, 'artifact.retentionMs', 1);
+    if (!Array.isArray(artifact.classes)) throw new Error('Artifact classes must be an explicit array');
+    const rules = new Set();
+    const classes = artifact.classes.map(rule => {
+      object(rule, 'artifact class');
+      if (Object.keys(rule).some(key => !['path', 'kind'].includes(key))) throw new Error('Unknown artifact class field');
+      const relative = text(rule.path, 'artifact class path');
+      if (relative !== '.' && relative.split('/').some(part => !part || part === '.' || part === '..' || /[\\:*?\[\]]/.test(part))) throw new Error('Artifact class paths must be literal relative slash paths');
+      const key = process.platform === 'win32' ? relative.toLowerCase() : relative;
+      if (!['reproducible_cache', 'configuration', 'credentials', 'evidence', 'unknown'].includes(rule.kind) || rules.has(key)) throw new Error('Invalid or duplicate artifact class');
+      rules.add(key);
+      return { path: relative, kind: rule.kind };
+    }).sort((a, b) => a.path.localeCompare(b.path));
+    return { id, path: root, owner, projects: [...artifact.projects].sort(), managedOnly: artifact.managedOnly, retentionMs: artifact.retentionMs, classes };
+  });
+  for (let i = 0; i < artifactRoots.length; i++) for (let j = 0; j < i; j++) if (overlap(artifactRoots[i].path, artifactRoots[j].path)) throw new Error('Artifact roots must not overlap; declare shared roots once');
   let nativeHost = null;
   if (value.nativeHost !== undefined) {
     const host = object(value.nativeHost, 'nativeHost');
     if (host.version !== 1 || !/^[a-f0-9]{64}$/.test(host.sha256 ?? '')) throw new Error('Unsupported or unpinned native host');
     nativeHost = { path: localPath(host.path), sha256: host.sha256, version: host.version };
   }
+  if (nativeHost && artifactRoots.some(root => overlap(root.path, nativeHost.path))) throw new Error('Artifact root overlaps protected native host');
   const sourceIds = new Set(), instances = new Set();
   if (value.eventSources !== undefined && !Array.isArray(value.eventSources)) throw new Error('eventSources must be an array');
   const eventSources = (value.eventSources ?? []).map(source => {
