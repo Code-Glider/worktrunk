@@ -14,6 +14,119 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[rstest]
+#[case::foreground(&["remove", "parent", "--foreground", "--yes"])]
+#[case::background(&["remove", "parent", "--yes"])]
+#[case::prune(&["step", "prune", "--min-age=0s", "--yes"])]
+#[case::preview(&["step", "prune", "--min-age=0s", "--dry-run", "--format=json"])]
+fn test_remove_preserves_nested_worktree(mut repo: TestRepo, #[case] args: &[&str]) {
+    repo.commit_in_worktree(
+        repo.root_path(),
+        ".gitignore",
+        ".worktrees/\n",
+        "Ignore children",
+    );
+    let parent = repo.add_worktree("parent");
+    let child = repo.add_worktree_at_path("child", &parent.join(".worktrees/ילד nested"));
+    repo.commit_in_worktree(&child, "unique.txt", "unique commit", "Unmerged child work");
+    fs::write(child.join("precious.txt"), "untracked child work").unwrap();
+    let before = repo.git_output(&["worktree", "list", "--porcelain"]);
+    let child_head = repo.git_output(&["rev-parse", "child"]);
+    assert!(repo.git_output(&["status", "--porcelain"]).is_empty());
+    let parent_status = repo
+        .git_command()
+        .args(["status", "--porcelain"])
+        .current_dir(&parent)
+        .run()
+        .unwrap();
+    assert!(
+        parent_status.stdout.is_empty(),
+        "ignored child must be invisible to status"
+    );
+
+    let output = repo.wt_command().args(args).output().unwrap();
+
+    assert!(
+        child.join("precious.txt").exists(),
+        "child data lost: {output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("precious.txt")).unwrap(),
+        "untracked child work"
+    );
+    assert_eq!(repo.git_output(&["rev-parse", "child"]), child_head);
+    assert_eq!(
+        repo.git_output(&["worktree", "list", "--porcelain"]),
+        before
+    );
+    if args[0] == "remove" {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("contains worktree"),
+            "{output:?}"
+        );
+    } else {
+        assert!(output.status.success(), "{output:?}");
+    }
+    if args.contains(&"--dry-run") {
+        let candidates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            candidates,
+            serde_json::json!([]),
+            "unsafe parent must not be advertised"
+        );
+    }
+}
+
+#[rstest]
+#[case::foreground(&["remove", "parent", "--foreground", "--yes"])]
+#[case::background(&["remove", "parent", "--yes"])]
+#[case::prune(&["step", "prune", "--min-age=0s", "--yes"])]
+fn test_remove_preserves_nested_worktree_created_by_hook(
+    mut repo: TestRepo,
+    #[case] args: &[&str],
+) {
+    repo.commit_in_worktree(
+        repo.root_path(),
+        ".gitignore",
+        ".worktrees/\n",
+        "Ignore children",
+    );
+    repo.write_project_config(r#"pre-remove = "git worktree add --detach .worktrees/late && echo precious > .worktrees/late/precious.txt""#);
+    repo.commit("Add hook");
+    let parent = repo.add_worktree("parent");
+    assert!(!parent.join(".worktrees/late").exists());
+
+    let output = repo.wt_command().args(args).output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "hook-created child must veto removal: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("contains worktree"),
+        "{output:?}"
+    );
+    let child = parent.join(".worktrees/late");
+    assert_eq!(
+        fs::read_to_string(child.join("precious.txt"))
+            .unwrap()
+            .trim(),
+        "precious"
+    );
+    assert!(
+        repo.git_output(&["worktree", "list", "--porcelain"])
+            .contains(".worktrees/late")
+    );
+    let head = repo
+        .git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&child)
+        .run()
+        .unwrap();
+    assert!(head.status.success());
+}
+
+#[rstest]
 fn test_remove_from_worktree(mut repo: TestRepo) {
     let worktree_path = repo.add_worktree("feature-wt");
 

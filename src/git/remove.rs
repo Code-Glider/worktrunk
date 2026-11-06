@@ -559,8 +559,8 @@ pub fn stage_worktree_removal(
 /// Canonical paths catch registrations made through symlinks; a missing entry
 /// has no directory to protect, while other resolution errors fail closed.
 ///
-/// Called only by merge cleanup: once while deciding whether to remove, then
-/// again after approved pre-remove hooks and before the final removal gates.
+/// Called during removal planning and again after approved pre-remove hooks,
+/// before the final removal gates.
 /// Keep this live registry read out of `stage_worktree_removal`: batch prune
 /// staging must not wait for another removal's registry teardown (#3954).
 pub fn nested_worktree(repo: &Repository, worktree_path: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -585,6 +585,18 @@ pub fn nested_worktree(repo: &Repository, worktree_path: &Path) -> anyhow::Resul
         }
     }
     Ok(None)
+}
+
+/// Refuse removal of a parent that would destroy another registered checkout.
+pub fn require_no_nested_worktrees(repo: &Repository, worktree_path: &Path) -> anyhow::Result<()> {
+    if let Some(nested) = nested_worktree(repo, worktree_path)? {
+        anyhow::bail!(color_print::cformat!(
+            "Cannot remove worktree @ <bold>{}</>; contains worktree @ <bold>{}</>",
+            format_path_for_display(worktree_path),
+            format_path_for_display(&nested)
+        ));
+    }
+    Ok(())
 }
 
 /// Rename a worktree into `<git-common-dir>/wt/trash/` and prune git metadata.

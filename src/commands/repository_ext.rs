@@ -364,6 +364,7 @@ impl RepositoryCliExt for Repository {
         // between — across the approval prompt and the `pre-remove` hook — is
         // caught there.
         target_wt.ensure_holds_this_worktree()?;
+        worktrunk::git::remove::require_no_nested_worktrees(self, &worktree_path)?;
 
         if !force_worktree {
             target_wt.ensure_clean("remove worktree", branch_name.as_deref(), true)?;
