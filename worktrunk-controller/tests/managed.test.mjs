@@ -164,7 +164,7 @@ test('helper failure kills its contained agent but never releases unknown owners
 
 test('controller crash leaves a running reservation protected across restart', { skip: process.platform !== 'win32' }, async t => {
   const s = setup(t), ready = path.join(s.root, 'ready');
-  const agent = `require('fs').writeFileSync(${JSON.stringify(ready)},'ready');setInterval(()=>{},20);`;
+  const agent = `require('fs').writeFileSync(${JSON.stringify(ready)},String(process.pid));setInterval(()=>{},20);`;
   const worker = fileURLToPath(new URL('./fixtures/managed-worker.mjs', import.meta.url));
   const parent = spawn(process.execPath, [worker, s.state, JSON.stringify(s.config), JSON.stringify({ root: s.root, sessionId: 'one', program: process.execPath, args: ['-e', agent] })], { stdio: 'ignore', windowsHide: true });
   const exited = once(parent, 'exit');
@@ -180,6 +180,14 @@ test('controller crash leaves a running reservation protected across restart', {
     parent.kill('SIGKILL'); await exited;
     const helper = s.store.list('claim')[0]?.value.evidence?.helperPid;
     if (helper) { try { process.kill(helper, 'SIGKILL'); } catch {} }
+    // Test teardown waits for job termination; it never releases the reservation.
+    const agentPid = fs.existsSync(ready) ? Number(fs.readFileSync(ready, 'utf8')) : null;
+    for (const pid of [helper, agentPid].filter(Boolean)) {
+      await until(() => {
+        try { process.kill(pid, 0); return false; }
+        catch (error) { if (error.code !== 'ESRCH') throw error; return true; }
+      });
+    }
   }
   assert.equal(inactive(s.store, s.root), false);
 });
