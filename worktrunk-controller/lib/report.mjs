@@ -154,7 +154,8 @@ export function report(config, store, { from, to, now = Date.now() }) {
     return { artifactId: root.id, observedAt: latest?.observedAt ?? null, policyCurrent: Boolean(current), status: latest?.decision.status ?? 'unavailable', reasons: latest?.decision.reasons ?? ['artifact_observation_unavailable'], logicalBytes: current ? b?.contents.logicalBytes ?? null : null, growthBytes: growthKnown ? b.contents.logicalBytes - a.contents.logicalBytes : null, growthFrom: growthKnown ? previous.observedAt : null, growthTo: growthKnown ? latest.observedAt : null };
   });
   return {
-    version: 1, from, to, asOf: now, applyEnabled: false,
+    version: 1, from, to, asOf: now, applyEnabled: Boolean(config.policy?.allowApply && process.platform === 'win32' && config.nativeHost), worktreeApplyEnabled: false,
+    actions: store.list('action').map(row => row.value).filter(action => action.owner === config.host?.id && action.projects?.some(id => registered.has(id))).map(action => ({ id: action.id, artifactId: action.artifactId, phase: action.phase, originalPath: action.originalPath, payloadPath: action.payloadPath, createdAt: action.createdAt, quarantinedAt: action.quarantinedAt, error: action.error })),
     coverage: [...sourceMap.values()].map(source => sourceCoverage(source, allEvents)),
     unassociatedTaskEvents, unassociatedSessionEvents,
     observedFirstAcceptedTasks: acceptedTasks.length,

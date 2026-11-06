@@ -108,14 +108,14 @@ test('schema/profile absence is unknown and content bounds/links cannot authoriz
   assert.ok(decideWorktree({ ...facts, enrolledAt: 2000 }, s.config.policy, 1000).reasons.includes('age_unknown'));
 });
 
-test('CLI scans in JSON and refuses unsupported mutation commands', t => {
+test('CLI scans in JSON and requires explicit action selection', t => {
   const s = controller(t, binary); git(s.root, 'config', 'worktrunk.default-branch', 'main');
   const cli = path.resolve(import.meta.dirname, '../bin/controller.mjs');
   const result = spawnSync(process.execPath, [cli, 'scan', '--config', s.filename, '--format', 'json'], { encoding: 'utf8', windowsHide: true });
   assert.equal(result.status, 0, result.stderr + result.stdout);
   assert.equal(JSON.parse(result.stdout).applyEnabled, false);
   const unsupported = spawnSync(process.execPath, [cli, 'apply', '--config', s.filename], { encoding: 'utf8', windowsHide: true });
-  assert.equal(unsupported.status, 1); assert.match(unsupported.stderr, /Usage:/);
+  assert.equal(unsupported.status, 1); assert.match(unsupported.stderr, /explicit --decision/);
 });
 
 test('native generic markers and Claude hooks record distinct sessions and survive recording failure', t => {

@@ -1,8 +1,8 @@
 # Worktrunk controller
 
-This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion, read-only reports and cooperative Windows producer admission are implemented. Quarantine, restore and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
+This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion, read-only reports, cooperative Windows producer admission and reversible selected artifact quarantine are implemented. Worktree actions and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
 
-Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` and `purge` are unavailable. The controller never treats ignored agent configuration as disposable cache.
+Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` supports explicitly selected artifact decisions only; `purge` is unavailable. The controller never treats ignored agent configuration as disposable cache.
 
 ## Development
 
@@ -49,11 +49,27 @@ node worktrunk-controller/bin/controller.mjs enroll-artifact --config <absolute-
 
 Enrollment records the existing directory's native incarnation in SQLite without writing inside it. Recreated directories, owner/project binding changes and missing enrollment require explicit repair; scans never adopt them. Scans include configured artifacts, ignored files and Git metadata, preserve mixed/unknown roots and report logical bytes.
 
-Artifacts stay report-only unless the owner explicitly adds `"producerAdmission":"cooperative-windows-job-v1"`. This asserts that every writer uses the native Windows managed admission boundary. Eligibility also requires matching enrollment/ownership, a freshly verified helper pin/protocol/incarnation, inactive producers and the shared preservation policy. Unsupported hosts and missing declarations retain content. `apply` remains unavailable while reversible actions are being built; no deployed launcher is qualified by the fixture tests.
+Artifacts stay report-only unless the owner explicitly adds `"producerAdmission":"cooperative-windows-job-v1"`. This asserts that every writer uses the native Windows managed admission boundary. Eligibility also requires matching enrollment/ownership, a freshly verified helper pin/protocol/incarnation, inactive producers and the shared preservation policy. Unsupported hosts and missing declarations retain content. No deployed launcher is qualified by the fixture tests.
 
 Managed `run` requires matching enrollment for every artifact root declared for its project. It reserves those roots and the checkout atomically, then rechecks every incarnation before acknowledging native launch. Shared-root cleanup conflicts block every declared project's admission. This coordination covers cooperative writers using the configured launcher; external writers remain unqualified.
 
 Reports expose the latest two artifact observations. Growth is the logical-byte difference for the same enrolled incarnation and configuration, with increasing timestamps and both samples in the report window. Missing samples, changed identity/policy and uncertain ordering yield unavailable growth. Shared roots count once across projects. Physical savings and reclaimed bytes remain unavailable.
+
+## Selected artifact quarantine and recovery
+
+With `policy.allowApply=true`, select one eligible artifact decision from the latest scan. The controller acquires a durable cleanup claim, creates an exclusive same-filesystem quarantine container and rechecks the full decision before renaming the enrolled directory into it. Changed content, configuration or identity requires another scan. Worktree decisions are refused. No files or branches are deleted.
+
+```console
+node worktrunk-controller/bin/controller.mjs apply --config <absolute-config.json> --decision <artifact-decision-id> --format json
+node worktrunk-controller/bin/controller.mjs reconcile --config <absolute-config.json> --action <action-id> --format json
+node worktrunk-controller/bin/controller.mjs restore --config <absolute-config.json> --action <action-id> --format json
+```
+
+The result includes an action ID and both paths; errors after intent creation include the action ID. Reports list current owned action phases and errors independently of their throughput date window. They read journal state without examining or repairing payloads. `applyEnabled` indicates whether configuration and host support artifact apply; `worktreeApplyEnabled` remains false. Every apply still checks fresh eligibility.
+
+Original and quarantine paths remain fenced against cooperative producers until restoration or proven pre-move cancellation. Filesystem moves and reconciliation share a SQLite write lock. If a controller stops, `reconcile` accepts only a matching native incarnation at exactly one location, completes its recorded direction or cancels an operation that provably never moved. It never retries an uncertain rename. Both locations, neither location, replaced parents/containers and a container created without a committed identity remain unresolved with the claim held. Such states require explicit repair; automatic repair is unavailable.
+
+`restore` works after cleanup is disabled or cache policy changes. Keep the same host, state and quarantine location. It refuses an occupied original path and verifies the original parent and quarantine container. If restoration was interrupted, reconcile it before retrying. Verified empty containers remain in quarantine; retention and purge are unavailable. This recovery covers process interruption and failed journal writes, not power-loss durability of directory renames or hostile filesystem writers.
 
 ## Observation boundary
 

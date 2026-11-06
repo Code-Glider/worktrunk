@@ -87,5 +87,5 @@ export function loadConfig(filename) {
     return { id, instance, role: source.role, projects: [...source.projects].sort(), authority: source.role === 'task' ? text(source.authority, 'source.authority') : null };
   });
   const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, nativeHost, projects, stateDir, quarantineDir, policy, limits, artifactRoots, eventSources };
-  return { ...normalized, generation: digest(normalized) };
+  return { ...normalized, generation: digest(normalized), configPath: localPath(filename) };
 }
