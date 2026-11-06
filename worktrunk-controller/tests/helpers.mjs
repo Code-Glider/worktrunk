@@ -6,6 +6,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { after } from 'node:test';
 import { loadConfig } from '../lib/config.mjs';
 
 export const controllerRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -14,7 +15,10 @@ export function nativeWorktrunk(name = 'wt') {
   const messages = execFileSync('cargo', ['build', '--locked', '--bin', name, '--message-format=json'], { cwd: path.dirname(controllerRoot), encoding: 'utf8', timeout: 300000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
   const artifact = messages.split('\n').filter(Boolean).map(line => JSON.parse(line)).findLast(message => message.reason === 'compiler-artifact' && message.target.name === name && message.executable);
   assert.ok(artifact, 'Cargo must report the actual executable');
-  return artifact.executable;
+  // Windows must not hold Cargo's replaceable output open during another build.
+  const pinned = path.join(fixture({ after }), path.basename(artifact.executable));
+  fs.copyFileSync(artifact.executable, pinned, fs.constants.COPYFILE_EXCL);
+  return pinned;
 }
 
 export function controller(t, binary) {

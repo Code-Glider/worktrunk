@@ -380,8 +380,33 @@ fn maybe_reap_result(result: &RemovalPlan, reap_enabled: bool) {
 pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> {
     let json_mode = args.format == SwitchFormat::Json;
     let verify = args.hooks.resolve();
+    let controller = worktrunk::controller::active();
+    if controller
+        && (args.branches.len() != 1
+            || !Path::new(&args.branches[0]).is_absolute()
+            || !args.foreground
+            || !args.no_delete_branch
+            || args.force
+            || args.force_delete
+            || args.reap
+            || !verify
+            || yes
+            || std::env::var_os("WORKTRUNK_PROJECT_CONFIG_PATH").is_some()
+            || std::env::var_os("WORKTRUNK_FIRST_OUTPUT").is_some())
+    {
+        anyhow::bail!(
+            "Controller removal requires one absolute worktree path, --foreground and --no-delete-branch; overrides are refused"
+        );
+    }
     let config = UserConfig::load().context("Failed to load config")?;
     let repo = Repository::current().context("Failed to remove worktree")?;
+    if controller {
+        let path = Path::new(&args.branches[0]);
+        worktrunk::controller::require_local_directory(path)?;
+        repo.worktree_at(path).ensure_holds_this_worktree()?;
+        worktrunk::controller::require_callback_free(repo.discovery_path())?;
+        worktrunk::controller::require_callback_free(path)?;
+    }
 
     // CLI flags override config; otherwise fall through to [remove] delete-branch
     // (defaults to true).
@@ -443,7 +468,11 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
             }
             builder.add(dest, &[HookType::PostSwitch]);
         }
-        match builder.finish().approve(pid, yes)? {
+        let selected = builder.finish();
+        if controller {
+            selected.require_no_commands()?;
+        }
+        match selected.approve(pid, yes)? {
             Some(plan) => Ok(plan),
             None => {
                 eprintln!(
@@ -461,6 +490,7 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
     } else {
         args.branches
     };
+    let controller_path = controller.then(|| std::path::PathBuf::from(&branches[0]));
 
     // Validate ALL first, then approve, then execute
     let plans = validate_remove_targets(
@@ -473,6 +503,29 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
     );
 
     let mut failed = !plans.errors.is_empty();
+    if controller
+        && (failed
+            || plans.others.len() != 1
+            || !plans.branch_only.is_empty()
+            || plans.current.is_some()
+            || !matches!(
+                &plans.others[0],
+                RemovalPlan::Worktree {
+                    branch_name: Some(_),
+                    ..
+                }
+            )
+            || !worktrunk::path::paths_match(
+                plans.others[0]
+                    .removed_worktree_path()
+                    .context("Missing controller worktree")?,
+                controller_path
+                    .as_deref()
+                    .context("Missing controller path")?,
+            ))
+    {
+        anyhow::bail!("Controller removal requires one existing non-current linked worktree");
+    }
     if !plans.has_valid_plans() {
         return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
     }
@@ -550,7 +603,9 @@ pub fn handle_remove_command(args: RemoveArgs, yes: bool) -> anyhow::Result<()> 
     // Fire-and-forget repo-wide internal cleanup (stale trash +
     // orphaned fsmonitor daemons) — runs after primary output so
     // it never delays the user-visible progress/success messages.
-    super::process::run_internal_sweep(&repo);
+    if !controller {
+        super::process::run_internal_sweep(&repo);
+    }
 
     if failed {
         return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());

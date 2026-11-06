@@ -1689,6 +1689,7 @@ impl Cmd {
             }
             cmd.env("GIT_NO_LAZY_FETCH", "1");
             cmd.env("GIT_ALLOW_PROTOCOL", "");
+            cmd.env("GIT_OPTIONAL_LOCKS", "0");
         }
         cmd.args(&self.args);
         cmd

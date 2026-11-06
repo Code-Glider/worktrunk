@@ -87,6 +87,14 @@ test('failed running-state commit prevents acknowledgement and leaves startup pr
   assert.equal(inactive(s.store, s.root), false);
 });
 
+test('native command spawn failure leaves ownership unresolved', { skip: process.platform !== 'win32' }, async t => {
+  const s = setup(t), program = path.join(s.root, 'invalid.exe');
+  fs.writeFileSync(program, 'not an executable');
+  await assert.rejects(runManaged(s.config, s.store, { root: s.root, sessionId: 'invalid-program', program, args: [] }), /completion unavailable/);
+  assert.equal(s.store.list('claim')[0].value.state, 'unresolved');
+  assert.equal(inactive(s.store, s.root), false);
+});
+
 test('failed completion commit never releases a finished producer claim', { skip: process.platform !== 'win32' }, async t => {
   const s = setup(t);
   s.store.db.exec("CREATE TRIGGER fail_ended BEFORE INSERT ON records WHEN NEW.kind='claim' AND json_extract(NEW.body,'$.state')='ended' BEGIN SELECT RAISE(ABORT,'injected completion commit failure'); END;");

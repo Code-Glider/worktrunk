@@ -14,6 +14,489 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[rstest]
+fn test_remove_controller_changes_only_selected_worktree(mut repo: TestRepo) {
+    let target = repo.add_worktree("feature");
+    let stale = repo.add_worktree("stale");
+    fs::remove_dir_all(&stale).unwrap();
+    let scratch = worktrunk::testing::test_tempdir();
+    let trash = crate::common::resolve_git_common_dir(repo.root_path()).join("wt/trash");
+    let unrelated = trash.join("unrelated-1");
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(unrelated.join("precious"), "unrelated trash").unwrap();
+    let sentinel = repo.path().join("fsmonitor-called");
+    repo.run_git(&[
+        "config",
+        "core.fsmonitor",
+        &format!(
+            "echo called > '{}'",
+            sentinel.display().to_string().replace('\\', "/")
+        ),
+    ]);
+    let refs = repo.git_output(&["show-ref"]);
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!target.exists());
+    assert_eq!(repo.git_output(&["show-ref"]), refs);
+    assert!(
+        repo.git_output(&["worktree", "list", "--porcelain"])
+            .contains("branch refs/heads/stale")
+    );
+    assert_eq!(
+        fs::read_to_string(unrelated.join("precious")).unwrap(),
+        "unrelated trash"
+    );
+    assert_eq!(fs::read_dir(&trash).unwrap().count(), 1);
+    assert!(!sentinel.exists());
+    std::thread::sleep(SLEEP_FOR_ABSENCE_CHECK);
+    assert!(unrelated.join("precious").exists());
+    assert!(!sentinel.exists());
+    repo.run_git(&["status", "--porcelain"]);
+    assert!(
+        sentinel.exists(),
+        "custom fsmonitor control must actually execute"
+    );
+}
+
+#[rstest]
+#[case::current("current")]
+#[case::branch("branch")]
+#[case::detached("detached")]
+#[case::multiple("multiple")]
+#[case::project_override("project")]
+fn test_remove_controller_refuses_ambiguous_targets(mut repo: TestRepo, #[case] kind: &str) {
+    let target = repo.add_worktree("feature");
+    if kind == "detached" {
+        repo.detach_head_in_worktree("feature");
+    }
+    let scratch = worktrunk::testing::test_tempdir();
+    let before = repo.git_output(&["worktree", "list", "--porcelain"]);
+    let mut command = repo.wt_command();
+    command.env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path());
+    if kind == "project" {
+        command.env("WORKTRUNK_PROJECT_CONFIG_PATH", "");
+    }
+    command.args([
+        "remove",
+        match kind {
+            "current" => repo.root_path().to_str().unwrap(),
+            "branch" => "feature",
+            _ => target.to_str().unwrap(),
+        },
+        "--foreground",
+        "--no-delete-branch",
+    ]);
+    if kind == "multiple" {
+        command.arg(repo.root_path());
+    }
+    let output = command.output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(target.exists());
+    assert_eq!(
+        repo.git_output(&["worktree", "list", "--porcelain"]),
+        before
+    );
+}
+
+#[rstest]
+fn test_remove_controller_refuses_user_hooks(mut repo: TestRepo) {
+    repo.write_test_config("post-remove = \"echo unsafe\"");
+    let target = repo.add_worktree("feature");
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Controller removal refuses hooks"),
+        "{output:?}"
+    );
+    assert!(target.exists());
+}
+
+#[rstest]
+fn test_remove_controller_rechecks_raw_bytes(mut repo: TestRepo) {
+    let target = repo.add_worktree("feature");
+    let file = target.join("file.txt");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    let set_time = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap()
+    };
+    set_time();
+    repo.run_git_in(&target, &["update-index", "--refresh"]);
+    repo.run_git(&["config", "core.trustctime", "false"]);
+    fs::write(&file, "changed content\n").unwrap();
+    set_time();
+    assert!(
+        repo.git_output(&["-C", target.to_str().unwrap(), "status", "--porcelain"])
+            .is_empty(),
+        "fixture must defeat Git's stat cache"
+    );
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("differs from retained Git objects"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read_to_string(file).unwrap(), "changed content\n");
+}
+
+#[cfg(windows)]
+#[rstest]
+fn test_remove_controller_refuses_locked_content(mut repo: TestRepo) {
+    use std::os::windows::fs::OpenOptionsExt;
+    let target = repo.add_worktree("feature");
+    let file = target.join("file.txt");
+    let _held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&file)
+        .unwrap();
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+            "--format=json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if target.exists() {
+        assert!(stderr.contains("direct fallback is refused"), "{output:?}");
+        assert_eq!(fs::read_to_string(file).unwrap(), "initial content\n");
+    } else {
+        assert!(stderr.contains("staged content remains"), "{output:?}");
+        assert!(
+            !output.stdout.is_empty(),
+            "teardown result must survive a later failure"
+        );
+        let trash = crate::common::resolve_git_common_dir(repo.root_path()).join("wt/trash");
+        let staged = fs::read_dir(trash)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("worktree/file.txt");
+        assert_eq!(fs::read_to_string(staged).unwrap(), "initial content\n");
+    }
+    assert!(repo.git_output(&["rev-parse", "feature"]).len() >= 40);
+}
+
+#[rstest]
+#[case::missing("missing")]
+#[case::truncated("truncated")]
+#[case::substituted("substituted")]
+fn test_remove_controller_requires_recoverable_blobs(mut repo: TestRepo, #[case] damage: &str) {
+    repo.commit_in_worktree(
+        repo.root_path(),
+        "recoverable.txt",
+        "only remaining copy\n",
+        "Unique content",
+    );
+    let target = repo.add_worktree("feature");
+    let oid = repo.git_output(&["rev-parse", "HEAD:recoverable.txt"]);
+    let oid = oid.trim();
+    let blob = crate::common::resolve_git_common_dir(repo.root_path())
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    let original = fs::read(&blob).unwrap();
+    fs::remove_file(&blob).unwrap();
+    match damage {
+        "missing" => {}
+        "truncated" => fs::write(&blob, &original[..original.len() - 5]).unwrap(),
+        "substituted" => {
+            let replacement = repo.git_output(&["rev-parse", "HEAD:file.txt"]);
+            let replacement = replacement.trim();
+            let other = crate::common::resolve_git_common_dir(repo.root_path())
+                .join("objects")
+                .join(&replacement[..2])
+                .join(&replacement[2..]);
+            fs::copy(other, &blob).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    if damage != "missing" {
+        let check = repo
+            .git_command()
+            .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+            .stdin_bytes(format!("{oid}\n"))
+            .run()
+            .unwrap();
+        assert!(check.status.success(), "metadata alone misses corruption");
+        assert_eq!(check.stdout, format!("{oid} blob\n").as_bytes());
+    }
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(target.join("recoverable.txt")).unwrap(),
+        "only remaining copy\n"
+    );
+}
+
+#[rstest]
+#[case::pre("pre-remove")]
+#[case::post("post-remove")]
+#[case::switch("post-switch")]
+fn test_remove_controller_refuses_project_hooks(mut repo: TestRepo, #[case] hook: &str) {
+    repo.write_project_config(&format!("{hook} = \"echo unsafe\""));
+    repo.commit("Configure removal hook");
+    repo.write_test_approvals("[projects.\"../origin\"]\napproved-commands = [\"echo unsafe\"]\n");
+    let target = repo.add_worktree("feature");
+    let scratch = worktrunk::testing::test_tempdir();
+    let before = repo.git_output(&["worktree", "list", "--porcelain"]);
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Controller removal refuses hooks"),
+        "{output:?}"
+    );
+    assert_eq!(
+        repo.git_output(&["worktree", "list", "--porcelain"]),
+        before
+    );
+    assert!(target.exists());
+    assert!(repo.git_output(&["rev-parse", "feature"]).len() >= 40);
+}
+
+#[rstest]
+#[case::yes("--yes")]
+#[case::hooks("--no-hooks")]
+#[case::force("--force")]
+#[case::delete("--force-delete")]
+fn test_remove_controller_refuses_overrides(mut repo: TestRepo, #[case] flag: &str) {
+    let target = repo.add_worktree("feature");
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+            flag,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(target.exists());
+}
+
+#[rstest]
+#[case::ignored(None)]
+#[case::assumed(Some("--assume-unchanged"))]
+#[case::skipped(Some("--skip-worktree"))]
+fn test_remove_controller_preserves_hidden_content(mut repo: TestRepo, #[case] flag: Option<&str>) {
+    repo.commit_in_worktree(
+        repo.root_path(),
+        ".gitignore",
+        "private/\n",
+        "Ignore private files",
+    );
+    let target = repo.add_worktree("feature");
+    let precious = if let Some(flag) = flag {
+        repo.run_git_in(&target, &["update-index", flag, "file.txt"]);
+        target.join("file.txt")
+    } else {
+        fs::create_dir(target.join("private")).unwrap();
+        target.join("private/config.yaml")
+    };
+    fs::write(&precious, "unique work").unwrap();
+    let scratch = worktrunk::testing::test_tempdir();
+    let before = repo.git_output(&["worktree", "list", "--porcelain"]);
+    let index = repo.git_output(&[
+        "-C",
+        target.to_str().unwrap(),
+        "rev-parse",
+        "--git-path",
+        "index",
+    ]);
+    let index_before = fs::read(index.trim()).unwrap();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(precious).unwrap(), "unique work");
+    assert_eq!(
+        repo.git_output(&["worktree", "list", "--porcelain"]),
+        before
+    );
+    assert_eq!(fs::read(index.trim()).unwrap(), index_before);
+}
+
+#[rstest]
+#[case::empty_directory(false)]
+#[case::nested_worktree(true)]
+fn test_remove_controller_preserves_descendants(mut repo: TestRepo, #[case] nested: bool) {
+    repo.commit_in_worktree(
+        repo.root_path(),
+        ".gitignore",
+        "private/\n",
+        "Ignore private files",
+    );
+    let target = repo.add_worktree("feature");
+    let child = target.join("private");
+    if nested {
+        repo.add_worktree_at_path("child", &child);
+    } else {
+        fs::create_dir(&child).unwrap();
+    }
+    let scratch = worktrunk::testing::test_tempdir();
+    let before = repo.git_output(&["worktree", "list", "--porcelain"]);
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(child.exists());
+    assert_eq!(
+        repo.git_output(&["worktree", "list", "--porcelain"]),
+        before
+    );
+}
+
+#[rstest]
+fn test_remove_controller_refuses_callbacks_before_status(mut repo: TestRepo) {
+    let target = repo.add_worktree("feature");
+    repo.run_git(&["config", "filter.test.clean", "exit 1"]);
+    let scratch = worktrunk::testing::test_tempdir();
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            target.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refuses configured Git callbacks"),
+        "{output:?}"
+    );
+    assert!(target.exists());
+}
+
+#[rstest]
+fn test_remove_controller_refuses_linked_target(mut repo: TestRepo) {
+    let target = repo.add_worktree("feature");
+    let scratch = worktrunk::testing::test_tempdir();
+    let link = scratch.path().join("alias");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    assert!(
+        worktrunk::shell_exec::Cmd::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .run()
+            .unwrap()
+            .status
+            .success()
+    );
+    let output = repo
+        .wt_command()
+        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .args([
+            "remove",
+            link.to_str().unwrap(),
+            "--foreground",
+            "--no-delete-branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must not traverse links"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("file.txt")).unwrap(),
+        "initial content\n"
+    );
+}
+
+#[rstest]
 #[case::foreground(&["remove", "parent", "--foreground", "--yes"])]
 #[case::background(&["remove", "parent", "--yes"])]
 #[case::prune(&["step", "prune", "--min-age=0s", "--yes"])]

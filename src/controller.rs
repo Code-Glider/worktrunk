@@ -20,14 +20,22 @@ pub fn scratch_directory() -> anyhow::Result<Option<PathBuf>> {
     if !path.is_absolute() || path.to_string_lossy().starts_with("\\\\") {
         bail!("Controller scratch must be an absolute local directory");
     }
+    require_local_directory(&path).context("Invalid controller scratch directory")?;
+    Ok(Some(path))
+}
+
+pub fn require_local_directory(path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() || path.to_string_lossy().starts_with("\\\\") {
+        bail!("Controller path must be an absolute local directory");
+    }
     for ancestor in path.ancestors() {
         let metadata = std::fs::symlink_metadata(ancestor)
-            .context("Failed to inspect controller scratch directory")?;
+            .context("Failed to inspect controller directory")?;
         if !metadata.file_type().is_dir() {
-            bail!("Controller scratch must not traverse links or non-directories");
+            bail!("Controller path must not traverse links or non-directories");
         }
     }
-    Ok(Some(path))
+    Ok(())
 }
 
 pub fn require_callback_free(path: &Path) -> anyhow::Result<()> {

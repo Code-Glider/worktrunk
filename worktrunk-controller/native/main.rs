@@ -85,16 +85,25 @@ fn contained_launch(launch: Launch, input: &mut impl BufRead) -> anyhow::Result<
         bail!("Controller admission was not acknowledged");
     }
     let output = std::io::stderr().as_handle().try_clone_to_owned()?;
-    let mut child = Command::new(&launch.program)
-        .args(&launch.args)
-        .current_dir(&launch.cwd)
-        .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("Managed command failed to start")?;
-    let status = child.wait().context("Managed command wait failed")?;
+    let mut trace =
+        worktrunk::trace::CommandTrace::new(None, &launch.program.display().to_string());
+    let result = (|| -> anyhow::Result<std::process::ExitStatus> {
+        let mut child = Command::new(&launch.program)
+            .args(&launch.args)
+            .current_dir(&launch.cwd)
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("Managed command failed to start")?;
+        child.wait().context("Managed command wait failed")
+    })();
+    match &result {
+        Ok(status) => trace.complete(status.success()),
+        Err(error) => trace.fail(error.as_ref()),
+    }
+    let status = result?;
     loop {
         // shortcut: more than 1024 job members fail closed; upgrade the wrapper before larger jobs.
         if job.query_process_id_list()? == [std::process::id() as usize] {

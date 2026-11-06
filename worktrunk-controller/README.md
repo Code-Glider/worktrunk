@@ -11,6 +11,7 @@ Use the repository's Rust 1.98 toolchain and Node 24.15.x. The Node controller h
 ```console
 node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
 cargo test --locked --test integration test_list_controller
+cargo test --locked --test integration test_remove_controller
 cargo test --locked --test integration integration_tests::claude_hook
 cargo test --locked --bin wt commands::list::json_v2::tests
 ```
@@ -41,6 +42,12 @@ Schema 2 carries an optional `observation` field only in the isolated profile. I
 Allowed repository metadata effects include Worktrunk's bounded SHA caches/LRU and existing audit-log permission hardening under `.git/wt`. Refs, real indexes and checkout contents must survive. SQLite records scans and decisions outside managed roots. Successful invocations remove only their own scratch; failed probes retain private scratch for explicit recovery. These leftovers are not yet swept automatically.
 
 The published observation/telemetry slice passed Windows and Linux CI, including documentation sync on Linux. The native lifetime helper has separate Windows fixtures; Linux/WSL producer containment is unavailable. Remaining roadmap gates must be measured before cleanup operations are called qualified.
+
+## Native removal prerequisite
+
+The isolated native profile also constrains the existing foreground remover to one absolute, noncurrent linked checkout with its branch retained. It refuses applicable user/project hooks, force/reap/approval bypasses, project-config overrides, links, hidden index entries and ignored/untracked content. It fully reads and rehashes retained local Git blobs, then compares raw checkout bytes to catch edits hidden by the stat cache. Missing/corrupt blobs and transformed checkouts, including CRLF content that differs from stored blobs, stay retained.
+
+Selected removal skips repository-wide trash and process housekeeping, custom fsmonitor and direct-removal fallback. Its exclusive staging container cannot replace existing trash. Registration/cleanup failures return nonzero and identify retained staging; teardown results survive later cleanup failures. Failed controller staging is excluded from ordinary trash drains and requires explicit recovery. This is a native prerequisite, not a controller `apply` or `purge` command: cooperative writer exclusion, quarantine, fresh policy checks and durable recovery are still required.
 
 ## Managed producer admission
 
