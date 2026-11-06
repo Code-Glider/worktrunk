@@ -2,8 +2,8 @@
 use crate::common::temp_home;
 use crate::common::{
     BareRepoTest, SLEEP_FOR_ABSENCE_CHECK, TestRepo, TestRepoBase, add_force_duplicate,
-    configure_directive_file, directive_file, make_snapshot_cmd, repo, repo_with_remote,
-    setup_snapshot_settings, setup_temp_snapshot_settings, wt_command,
+    canonicalize, configure_directive_file, directive_file, make_snapshot_cmd, repo,
+    repo_with_remote, setup_snapshot_settings, setup_temp_snapshot_settings, wt_command,
 };
 use ansi_str::AnsiStr;
 use insta::assert_snapshot;
@@ -35,7 +35,10 @@ fn test_remove_controller_changes_only_selected_worktree(mut repo: TestRepo) {
     let refs = repo.git_output(&["show-ref"]);
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -81,7 +84,10 @@ fn test_remove_controller_refuses_ambiguous_targets(mut repo: TestRepo, #[case] 
     let scratch = worktrunk::testing::test_tempdir();
     let before = repo.git_output(&["worktree", "list", "--porcelain"]);
     let mut command = repo.wt_command();
-    command.env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path());
+    command.env(
+        "WORKTRUNK_CONTROLLER_SCRATCH",
+        canonicalize(scratch.path()).unwrap(),
+    );
     if kind == "project" {
         command.env("WORKTRUNK_PROJECT_CONFIG_PATH", "");
     }
@@ -114,7 +120,10 @@ fn test_remove_controller_refuses_user_hooks(mut repo: TestRepo) {
     let scratch = worktrunk::testing::test_tempdir();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -157,7 +166,10 @@ fn test_remove_controller_rechecks_raw_bytes(mut repo: TestRepo) {
     let scratch = worktrunk::testing::test_tempdir();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -188,7 +200,10 @@ fn test_remove_controller_refuses_locked_content(mut repo: TestRepo) {
     let scratch = worktrunk::testing::test_tempdir();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -269,7 +284,10 @@ fn test_remove_controller_requires_recoverable_blobs(mut repo: TestRepo, #[case]
     let scratch = worktrunk::testing::test_tempdir();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -298,7 +316,10 @@ fn test_remove_controller_refuses_project_hooks(mut repo: TestRepo, #[case] hook
     let before = repo.git_output(&["worktree", "list", "--porcelain"]);
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -330,7 +351,10 @@ fn test_remove_controller_refuses_overrides(mut repo: TestRepo, #[case] flag: &s
     let scratch = worktrunk::testing::test_tempdir();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -376,7 +400,10 @@ fn test_remove_controller_preserves_hidden_content(mut repo: TestRepo, #[case] f
     let index_before = fs::read(index.trim()).unwrap();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -415,7 +442,10 @@ fn test_remove_controller_preserves_descendants(mut repo: TestRepo, #[case] nest
     let before = repo.git_output(&["worktree", "list", "--porcelain"]);
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -439,7 +469,10 @@ fn test_remove_controller_refuses_callbacks_before_status(mut repo: TestRepo) {
     let scratch = worktrunk::testing::test_tempdir();
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             target.to_str().unwrap(),
@@ -476,7 +509,10 @@ fn test_remove_controller_refuses_linked_target(mut repo: TestRepo) {
     );
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args([
             "remove",
             link.to_str().unwrap(),

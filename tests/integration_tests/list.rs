@@ -1,6 +1,6 @@
 use crate::common::{
-    DAY, HOUR, MINUTE, TestRepo, list_snapshots, make_snapshot_cmd, repo, repo_with_remote,
-    setup_snapshot_settings_for_paths, wt_command,
+    DAY, HOUR, MINUTE, TestRepo, canonicalize, list_snapshots, make_snapshot_cmd, repo,
+    repo_with_remote, setup_snapshot_settings_for_paths, wt_command,
 };
 use insta_cmd::assert_cmd_snapshot;
 use rstest::rstest;
@@ -52,7 +52,10 @@ fn test_list_controller_scratch_isolated(mut repo: TestRepo) {
     repo.run_git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .env("TMP", shared.path())
         .env("TEMP", shared.path())
         .env("TMPDIR", shared.path())
@@ -109,6 +112,41 @@ fn test_list_controller_rejects_invalid_scratch(repo: TestRepo) {
     }
 }
 
+#[cfg(unix)]
+#[rstest]
+fn test_list_controller_requires_resolved_scratch(repo: TestRepo) {
+    let scratch = worktrunk::testing::test_tempdir();
+    let resolved = canonicalize(scratch.path()).unwrap();
+    let parent = worktrunk::testing::test_tempdir();
+    let alias = parent.path().join("alias");
+    std::os::unix::fs::symlink(&resolved, &alias).unwrap();
+    std::fs::create_dir(resolved.join("private")).unwrap();
+    assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
+    for (path, succeeds) in [
+        (alias.join("private"), false),
+        (resolved.join("private"), true),
+    ] {
+        let output = repo
+            .wt_command()
+            .env("WORKTRUNK_CONTROLLER_SCRATCH", path)
+            .args(["list", "--format=json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), succeeds, "{output:?}");
+        if succeeds {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["schema"], 2);
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("must not traverse links"));
+        }
+        assert_eq!(
+            std::fs::read_dir(resolved.join("private")).unwrap().count(),
+            0
+        );
+    }
+}
+
 #[rstest]
 fn test_list_controller_disables_custom_fsmonitor(repo: TestRepo) {
     let scratch = worktrunk::testing::test_tempdir();
@@ -120,7 +158,10 @@ fn test_list_controller_disables_custom_fsmonitor(repo: TestRepo) {
     repo.run_git(&["config", "core.fsmonitor", &command]);
     let output = repo
         .wt_command()
-        .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+        .env(
+            "WORKTRUNK_CONTROLLER_SCRATCH",
+            canonicalize(scratch.path()).unwrap(),
+        )
         .args(["list", "--format=json"])
         .output()
         .unwrap();
@@ -149,7 +190,10 @@ fn test_list_controller_refuses_git_callbacks(repo: TestRepo) {
         repo.run_git(&["config", key, "exit 1"]);
         let output = repo
             .wt_command()
-            .env("WORKTRUNK_CONTROLLER_SCRATCH", scratch.path())
+            .env(
+                "WORKTRUNK_CONTROLLER_SCRATCH",
+                canonicalize(scratch.path()).unwrap(),
+            )
             .args(["list", "--format=json"])
             .output()
             .unwrap();
