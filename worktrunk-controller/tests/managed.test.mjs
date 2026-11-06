@@ -27,7 +27,9 @@ async function until(predicate) {
 }
 function suspend(pid, resume = false) {
   const script = fileURLToPath(new URL('./fixtures/suspend.ps1', import.meta.url));
-  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-FixtureProcessId', String(pid), ...(resume ? ['-Resume'] : [])], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+  // Cold PowerShell/Add-Type startup competes with parallel native builds in CI.
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-FixtureProcessId', String(pid), ...(resume ? ['-Resume'] : [])], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+  assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr);
 }
 
@@ -37,7 +39,7 @@ test('native host refuses unsupported lifetime containment without starting an a
   assert.equal(result.status, 1); assert.match(result.stderr, /not qualified/); assert.equal(fs.existsSync(sentinel), false);
 });
 
-test('native job retains detached and OS-suspended descendants until completion', { skip: process.platform !== 'win32' }, async t => {
+test('native job retains detached and OS-suspended descendants until completion', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {
   const s = setup(t), ready = path.join(s.root, 'ready'), gate = path.join(s.root, 'gate'), done = path.join(s.root, 'done'), heartbeat = path.join(s.root, 'heartbeat');
   const descendant = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)},String(process.pid));let n=0;const timer=setInterval(()=>{fs.writeFileSync(${JSON.stringify(heartbeat)},String(++n));if(fs.existsSync(${JSON.stringify(gate)})){clearInterval(timer);fs.writeFileSync(${JSON.stringify(done)},'finished');}},20);`;
   const parent = `const c=require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{detached:true,stdio:'ignore'});c.unref();`;
