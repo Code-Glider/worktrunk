@@ -5,8 +5,27 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import { loadConfig } from '../lib/config.mjs';
 
 export const controllerRoot = fileURLToPath(new URL('../', import.meta.url));
+
+export function nativeWorktrunk() {
+  const messages = execFileSync('cargo', ['build', '--locked', '--bin', 'wt', '--message-format=json'], { cwd: path.dirname(controllerRoot), encoding: 'utf8', timeout: 300000, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+  const artifact = messages.split('\n').filter(Boolean).map(line => JSON.parse(line)).findLast(message => message.reason === 'compiler-artifact' && message.target.name === 'wt' && message.executable);
+  assert.ok(artifact, 'Cargo must report the actual executable');
+  return artifact.executable;
+}
+
+export function controller(t, binary) {
+  const repo = repository(t);
+  const registry = path.join(repo.base, 'projects.json');
+  fs.writeFileSync(registry, JSON.stringify({ version: 1, projects: [{ id: 'myproject', root: repo.root }] }));
+  const value = { version: 1, host: { id: 'test-host', platform: process.platform }, registry, stateDir: repo.state, quarantineDir: path.join(repo.base, 'quarantine'), worktrunk: { path: binary, sha256: createHash('sha256').update(fs.readFileSync(binary)).digest('hex'), version: '0.81.0', schema: 2 }, policy: { generation: 1, minAgeMs: 100, retentionMs: 1000, allowApply: false, deleteBranches: false }, limits: { timeoutMs: 10000, maxFiles: 1000, maxBytes: 10000000 }, artifactRoots: [] };
+  const filename = path.join(repo.base, 'config.json');
+  fs.writeFileSync(filename, JSON.stringify(value));
+  return { ...repo, filename, config: loadConfig(filename) };
+}
 
 export function child(mode, state, ...args) {
   const worker = fileURLToPath(new URL('./fixtures/state-worker.mjs', import.meta.url));

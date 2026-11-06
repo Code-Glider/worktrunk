@@ -369,6 +369,8 @@ pub struct ListData {
     /// output distinguish "absent because not requested" from "requested but
     /// undetermined".
     pub collected: Collected,
+    pub snapshot: Option<std::sync::Arc<worktrunk::git::RefSnapshot>>,
+    pub integration_targets: Option<worktrunk::git::IntegrationTargets>,
 }
 
 /// Fact families whose collection is gated (`--full`, `[list] summary`).

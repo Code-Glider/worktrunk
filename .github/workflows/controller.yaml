@@ -1,0 +1,40 @@
+name: controller
+
+on:
+  push:
+    branches: [main, 'fork/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controller-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  controller:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.15.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Controller tests
+        run: node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
+      - name: Native observation contract
+        run: cargo test --locked --test integration test_list_controller
+      - name: Schema contract
+        run: cargo test --locked --bin wt commands::list::json_v2::tests
+      - name: Documentation sync
+        if: runner.os == 'Linux'
+        run: cargo test --locked --test integration test_docs_are_in_sync

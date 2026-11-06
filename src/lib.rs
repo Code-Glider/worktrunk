@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod command_log;
 pub mod config;
+pub mod controller;
 pub mod copy;
 pub mod docs;
 pub mod git;
