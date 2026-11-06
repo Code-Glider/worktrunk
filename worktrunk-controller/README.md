@@ -33,6 +33,22 @@ node worktrunk-controller/bin/controller.mjs enroll --config <absolute-config.js
 
 Each inventory item has a decision ID, status and reasons. Logical bytes describe checkout content; estimated physical savings remain unavailable. Ignored/untracked files, hidden index entries, links, nested repositories, user locks, primary/default checkouts, unknown age and protected paths veto eligibility. Assume-unchanged and skip-worktree flags make cleanliness unknown. Missing task authority and producer admission currently retain every otherwise clean candidate. A failed probe produces `analysis_failed`, keeps the data and makes the CLI exit nonzero.
 
+## Scan/report job example
+
+[scheduling/scan-report.ps1](scheduling/scan-report.ps1) runs only `scan`, then `report` for `[today UTC − 7 days, today UTC)`. It fixes the window once per invocation, stops on either command's failure and shares a default 900-second wait budget between the commands and output forwarding. It uses the existing configured registry and artifact allowlist. Scans retain their documented state/metadata writes; this job never invokes enrollment, cleanup or reconciliation.
+
+Use native Windows, PowerShell 7 and Node 24.15.x. Supply absolute Node/config paths and keep the private configuration outside managed roots. The configuration directory must be writable: a persistent, empty `controller.json.scan-report.lock` beside it holds an exclusive handle while participating runners use that same path. Leave the file present. Separate config aliases, direct CLI calls and orphan observers after abrupt runner termination are outside this cooperative lock.
+
+```powershell
+& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -NonInteractive -File 'C:\code\worktrunk\worktrunk-controller\scheduling\scan-report.ps1' -Node 'C:\tools\node.exe' -Config 'C:\private\controller.json' *> 'C:\private\scan-report.log'
+```
+
+That explicit log destination is replaced on each manual invocation; keep it outside managed roots. Scan state remains in SQLite, while generated reports go to the caller. Task Scheduler does not preserve stdout: the XML example alone retains scan state, not a report log. Use the existing `report` command to regenerate a report or provide caller-owned capture during deployment qualification.
+
+[scheduling/scan-report-task.example.xml](scheduling/scan-report-task.example.xml) is a **disabled** daily 03:00 local-time example with an interactive user token, least privilege, `IgnoreNew` and a 16-minute scheduler limit. Replace every `REPLACE` path and the user SID, review the working directory/configuration and retain scan-only policy before any future pilot. It requires that user to be logged in. Nothing registers, enables or installs this task, and no scheduled apply job is provided.
+
+The runner bounds its process/output waits and gives direct-process termination at most five additional seconds. At timeout it requests [.NET process-tree termination](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.kill); this is best effort, and direct-process exit does not prove every descendant ended. Output is forwarded concurrently with bounded waits. These fixtures do not qualify producer containment, unexpected runner death, power loss or a real scheduled host. Scheduling deployment remains deferred.
+
 ## Artifact roots
 
 Artifact roots are explicit configuration, including owner, registered projects, a managed-producer declaration and retention. Declare a shared root once with every project that writes it. Roots cannot overlap each other, state, quarantine, controller code or other protected paths. For example:
