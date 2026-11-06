@@ -936,6 +936,7 @@ pub fn handle_state_set(key: &str, value: String, branch: Option<String>) -> any
 
             let config_key = format!("worktrunk.state.{branch_name}.marker");
             repo.set_config(&config_key, &json.to_string())?;
+            super::observer::observe_marker(Some(&value), None);
 
             eprintln!(
                 "{}",
@@ -1022,7 +1023,9 @@ pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyho
                     repo.require_selected_branch(branch.as_deref().unwrap_or("@"), "clear marker")?;
 
                 let config_key = format!("worktrunk.state.{branch_name}.marker");
-                if repo.unset_config(&config_key)? {
+                let cleared = repo.unset_config(&config_key)?;
+                super::observer::observe_marker(None, None);
+                if cleared {
                     eprintln!(
                         "{}",
                         success_message(cformat!("Cleared marker for <bold>{branch_name}</>"))

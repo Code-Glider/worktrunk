@@ -1,6 +1,6 @@
 # Worktrunk controller
 
-This fork adds a scan-only controller for worktree cleanup and agent throughput. The durable state and worktree analyzer are implemented. Event adapters, throughput reports, managed producer admission, quarantine, restore and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
+This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion and read-only reports are implemented. Managed producer admission, quarantine, restore and selected purge are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
 
 Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` and `purge` are unavailable. The controller never treats ignored agent configuration as disposable cache.
 
@@ -11,6 +11,7 @@ Use the repository's Rust 1.98 toolchain and Node 24.15.x. There are no controll
 ```console
 node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
 cargo test --locked --test integration test_list_controller
+cargo test --locked --test integration integration_tests::claude_hook
 cargo test --locked --bin wt commands::list::json_v2::tests
 ```
 
@@ -40,3 +41,26 @@ Schema 2 carries an optional `observation` field only in the isolated profile. I
 Allowed repository metadata effects include Worktrunk's bounded SHA caches/LRU and existing audit-log permission hardening under `.git/wt`. Refs, real indexes and checkout contents must survive. SQLite records scans and decisions outside managed roots. Successful invocations remove only their own scratch; failed probes retain private scratch for explicit recovery. These leftovers are not yet swept automatically.
 
 Native Windows fixtures currently pass. The full documentation sync is excluded by upstream on Windows; the schema was generated from the binary and schema unit tests pass. Linux CI and the remaining roadmap gates must be measured before their platforms or cleanup operations are called qualified.
+
+## Events and throughput
+
+Configure `eventSources` explicitly. Each source has an `id`, immutable `instance`, `role` (`host` or `task`) and a nonempty list of registered `projects`. Task sources also require an `authority` namespace. A changed source binding needs a new instance. Configuration grants ingestion authority; a host event cannot assert task acceptance. No real task tracker is selected or installed by this implementation.
+
+```json
+{"id":"tracker","instance":"tracker-installation-1","role":"task","projects":["registered-project-id"],"authority":"chosen-task-tracker"}
+```
+
+Send one normalized version-1 JSON event on stdin. Required fields are `eventId`, `type` and `project`. Use stable IDs for replay; conflicting replays and source sequence collisions fail. Task projection requires `authorityProject` and `taskId`; attempt outcomes also need `attemptId` and consistent `attemptNumber` to measure first-attempt results. Host projection requires `sessionId`. Optional `at` is UTC epoch milliseconds and `sequence` is a positive source-wide integer. Missing evidence remains unavailable. Raw prompts, transcripts and arbitrary fields are rejected.
+
+```console
+node worktrunk-controller/bin/controller.mjs ingest --config <absolute-config.json> --source tracker --format json
+node worktrunk-controller/bin/controller.mjs report --config <absolute-config.json> --from 2026-11-01 --to 2026-11-06 --format json
+```
+
+The report's UTC end date is exclusive and cannot be in the future. Task event types are `task_started`, `attempt_started`, `attempt_accepted`, `attempt_failed`, `attempt_cancelled`, `task_reopened` and `task_revoked`. Host types are `session_started`, `working`, `waiting`, `session_ended` and `association`. Either source may send an independent `checkpoint` with `fromSequence`/`throughSequence` to expose gaps; checkpoints do not occupy an event sequence. Coverage remains partial and unmeasured even when a declared range is complete.
+
+Reports count each task's first observed acceptance once, by Monday UTC week and authority/project/task identity. Cancellations remain in the first-attempt denominator. Median/p95 durations use accepted tasks with known start/end times; missing or inconsistent timing is unavailable. Attribution counts one team task and keeps multiple contributors separate from single-agent counts. Sessions are independent across source instances and session IDs, including when they share a branch. Waiting/working intervals and overlap are observed samples, not process liveness or a utilization estimate. Artifact growth, reclaimed bytes and usage remain unavailable.
+
+`report` requires existing state and opens SQLite read-only; it never initializes a database. Conflicting simultaneous session states without source ordering and known source-sequence gaps across intervals make session durations and overlap unavailable. Sequences belong to the entire source, so known events from another session or project fill their sequence positions. State-only events preserve the last explicit repository/worktree association.
+
+The native marker setter and Claude direct helper optionally record host observations when a launcher supplies all of `WORKTRUNK_OBSERVER_NODE`, `WORKTRUNK_OBSERVER_SCRIPT`, `WORKTRUNK_OBSERVER_CONFIG` (absolute paths), `WORKTRUNK_OBSERVER_SOURCE` and `WORKTRUNK_OBSERVER_PROJECT`. Generic markers also require `WORKTRUNK_OBSERVER_SESSION`; Claude supplies its payload's session ID. The source must have role `host`. Working/waiting markers record their corresponding state; clearing a marker or Claude SessionEnd ends only that session. Claude Stop means waiting. Recording is bounded to two seconds, failure preserves the original marker/hook result, and the raw Claude payload is never forwarded. Installation and launcher wiring are deferred. Observations grant neither managed producer ownership nor cleanup permission.

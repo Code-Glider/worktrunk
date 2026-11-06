@@ -48,3 +48,26 @@ test('junction/symlink traversal is rejected at native path boundary', t => {
   fs.symlinkSync(s.root, link, process.platform === 'win32' ? 'junction' : 'dir');
   assert.throws(() => localPath(path.join(link, 'anything'), { missing: true }), /Link traversal/);
 });
+
+test('event authorities require unique instances, explicit roles and registered projects', t => {
+  const s = setup(t);
+  const source = { id: 'tasks', instance: 'tracker-one', role: 'task', projects: ['myproject'], authority: 'issue-tracker' };
+  s.config.eventSources = [source];
+  assert.equal(s.load().eventSources[0].authority, 'issue-tracker');
+  delete source.authority; assert.throws(s.load, /authority/); source.authority = 'issue-tracker';
+  source.projects = ['outside']; assert.throws(s.load, /registered/); source.projects = ['myproject'];
+  s.config.eventSources.push({ ...source, id: 'other' }); assert.throws(s.load, /Duplicate event source/);
+});
+
+test('optional paths may disappear after lstat without hiding links or required-path errors', t => {
+  const s = setup(t), filename = path.join(s.base, 'transient-journal');
+  const native = fs.realpathSync.native;
+  t.mock.method(fs.realpathSync, 'native', value => {
+    if (value === filename) fs.unlinkSync(filename);
+    return native(value);
+  });
+  fs.writeFileSync(filename, 'journal');
+  assert.equal(localPath(filename, { missing: true }), filename);
+  fs.writeFileSync(filename, 'journal');
+  assert.throws(() => localPath(filename), { code: 'ENOENT' });
+});

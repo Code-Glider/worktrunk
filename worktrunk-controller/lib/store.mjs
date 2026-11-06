@@ -7,16 +7,17 @@ import { localPath } from './paths.mjs';
 // All identities, events, claims and action intents commit through this boundary.
 // Acknowledgment follows COMMIT; interrupted transactions are SQLite's rollback.
 export class Store {
-  constructor(directory) {
-    const root = localPath(directory, { missing: true });
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  constructor(directory, { readOnly = false } = {}) {
+    const root = localPath(directory, { missing: !readOnly });
+    if (!readOnly) fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const filename = path.join(localPath(root), 'controller.sqlite');
-    for (const suffix of ['', '-wal', '-shm', '-journal']) localPath(filename + suffix, { missing: true });
-    this.db = new DatabaseSync(filename);
+    for (const suffix of ['', '-wal', '-shm', '-journal']) localPath(filename + suffix, { missing: suffix !== '' || !readOnly });
+    this.db = new DatabaseSync(filename, { readOnly });
     try {
-      this.db.exec('PRAGMA busy_timeout=10000; PRAGMA synchronous=FULL;');
+      this.db.exec('PRAGMA busy_timeout=10000;');
+      if (!readOnly) this.db.exec('PRAGMA synchronous=FULL;');
       const version = this.db.prepare('PRAGMA user_version').get().user_version;
-      if (version !== 0 && version !== 1) throw new Error('Unsupported state schema');
+      if (version !== 1 && (readOnly || version !== 0)) throw new Error('Unsupported state schema');
       if (this.db.prepare('PRAGMA quick_check').get().quick_check !== 'ok') throw new Error('Corrupt controller state');
       if (version === 0) {
         this.db.exec('BEGIN IMMEDIATE');
@@ -29,7 +30,6 @@ export class Store {
           this.db.exec('COMMIT');
         } catch (error) { this.db.exec('ROLLBACK'); throw error; }
       }
-      this.db.exec('PRAGMA journal_mode=WAL;');
     } catch (error) { this.db.close(); throw error; }
   }
 

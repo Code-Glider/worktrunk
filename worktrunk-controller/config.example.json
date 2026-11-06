@@ -18,5 +18,6 @@
     "deleteBranches": false
   },
   "limits": { "timeoutMs": 10000, "maxFiles": 100000, "maxBytes": 1073741824 },
-  "artifactRoots": []
+  "artifactRoots": [],
+  "eventSources": []
 }

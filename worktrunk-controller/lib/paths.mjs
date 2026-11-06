@@ -27,7 +27,13 @@ export function localPath(value, { missing = false } = {}) {
       else throw error;
     }
   }
-  return absent ? resolved : fs.realpathSync.native(resolved);
+  if (absent) return resolved;
+  try { return fs.realpathSync.native(resolved); }
+  catch (error) {
+    // SQLite can unlink a journal between the boundary checks and resolution.
+    if (missing && error.code === 'ENOENT') return resolved;
+    throw error;
+  }
 }
 
 export function fileIdentity(value) {

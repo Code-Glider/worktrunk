@@ -7,6 +7,8 @@ import { Store } from '../lib/store.mjs';
 import { enroll } from '../lib/identity.mjs';
 import { scanProject, inventoryContents, validateObservation } from '../lib/observe.mjs';
 import { decideWorktree } from '../lib/policy.mjs';
+import { loadConfig } from '../lib/config.mjs';
+import { report } from '../lib/report.mjs';
 import { controller, git, nativeWorktrunk } from './helpers.mjs';
 
 const binary = nativeWorktrunk();
@@ -114,4 +116,80 @@ test('CLI scans in JSON and refuses unsupported mutation commands', t => {
   assert.equal(JSON.parse(result.stdout).applyEnabled, false);
   const unsupported = spawnSync(process.execPath, [cli, 'apply', '--config', s.filename], { encoding: 'utf8', windowsHide: true });
   assert.equal(unsupported.status, 1); assert.match(unsupported.stderr, /Usage:/);
+});
+
+test('native generic markers and Claude hooks record distinct sessions and survive recording failure', t => {
+  const s = controller(t, binary);
+  const raw = JSON.parse(fs.readFileSync(s.filename, 'utf8'));
+  raw.eventSources = [{ id: 'host', instance: 'native-host', role: 'host', projects: ['myproject'] }];
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const config = loadConfig(s.filename);
+  const emptyGit = path.join(s.base, 'observer-gitconfig'), emptyWt = path.join(s.base, 'observer.toml');
+  fs.writeFileSync(emptyGit, ''); fs.writeFileSync(emptyWt, '');
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(WORKTRUNK_|GIT_)/i.test(key))), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: emptyGit, WORKTRUNK_CONFIG_PATH: emptyWt, WORKTRUNK_SYSTEM_CONFIG_PATH: emptyWt, WORKTRUNK_PROJECT_CONFIG_PATH: '', CLAUDE_PROJECT_DIR: s.root,
+    WORKTRUNK_OBSERVER_NODE: process.execPath, WORKTRUNK_OBSERVER_SCRIPT: path.resolve(import.meta.dirname, '../bin/controller.mjs'), WORKTRUNK_OBSERVER_CONFIG: s.filename, WORKTRUNK_OBSERVER_SOURCE: 'host', WORKTRUNK_OBSERVER_PROJECT: 'myproject', WORKTRUNK_OBSERVER_SESSION: 'generic' };
+  function run(args, payload) {
+    const result = spawnSync(binary, args, { cwd: s.root, env, input: payload && JSON.stringify(payload), encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr); return result;
+  }
+  const hook = type => run(['config', 'plugins', 'claude', 'hook'], { hook_event_name: type, session_id: 'claude', prompt: 'secret prompt never persist' });
+  run(['config', 'state', 'marker', 'set', '🤖']);
+  hook('UserPromptSubmit'); hook('Stop');
+  run(['config', 'state', 'marker', 'clear']);
+  let store = new Store(s.state);
+  try {
+    const now = Date.now();
+    const result = report(config, store, { from: now - 60000, to: now, now });
+    assert.equal(result.sessions.length, 2);
+    assert.equal(result.sessions.find(session => session.sessionId === 'generic').currentState, 'ended');
+    const claude = result.sessions.find(session => session.sessionId === 'claude');
+    assert.equal(claude.currentState, 'unknown'); assert.equal(claude.lastObservedState, 'waiting');
+    assert.equal(result.observedFirstAcceptedTasks, 0);
+    assert.equal(JSON.stringify(store.list('event')).includes('secret prompt'), false);
+  } finally { store.close(); }
+  hook('SessionEnd');
+  env.WORKTRUNK_OBSERVER_SESSION = 'second';
+  run(['config', 'state', 'marker', 'set', '🤖']);
+  env.WORKTRUNK_OBSERVER_SESSION = 'third';
+  run(['config', 'state', 'marker', 'set', '🤖']);
+  env.WORKTRUNK_OBSERVER_SESSION = 'second';
+  run(['config', 'state', 'marker', 'clear']);
+  env.WORKTRUNK_OBSERVER_SESSION = 'third';
+  run(['config', 'state', 'marker', 'clear']);
+  store = new Store(s.state);
+  let recorded;
+  try { recorded = store.list('event').length; assert.equal(store.list('event').filter(row => row.value.event.type === 'session_ended').length, 4); } finally { store.close(); }
+  for (const session_id of [42, {}, null, '']) run(['config', 'plugins', 'claude', 'hook'], { hook_event_name: 'UserPromptSubmit', session_id });
+  store = new Store(s.state);
+  try { assert.equal(store.list('event').length, recorded); } finally { store.close(); }
+  assert.equal(JSON.parse(git(s.root, 'config', '--get', 'worktrunk.state.main.marker')).marker, '🤖');
+  fs.writeFileSync(path.join(s.state, 'controller.sqlite'), 'damaged evidence');
+  run(['config', 'state', 'marker', 'set', '🤖']); hook('Stop');
+  assert.equal(JSON.parse(git(s.root, 'config', '--get', 'worktrunk.state.main.marker')).marker, '💬');
+  assert.equal(fs.readFileSync(path.join(s.state, 'controller.sqlite'), 'utf8'), 'damaged evidence');
+});
+
+test('CLI ingests authoritative events and reports JSON/text with a strict UTC window', t => {
+  const s = controller(t, binary);
+  const raw = JSON.parse(fs.readFileSync(s.filename, 'utf8'));
+  raw.eventSources = [{ id: 'tasks', instance: 'tracker', role: 'task', authority: 'test-tracker', projects: ['myproject'] }];
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const cli = path.resolve(import.meta.dirname, '../bin/controller.mjs');
+  const invoke = (args, input) => spawnSync(process.execPath, [cli, ...args, '--config', s.filename], { input, encoding: 'utf8', windowsHide: true });
+  const event = { version: 1, eventId: 'accepted', project: 'myproject', type: 'attempt_accepted', taskId: '1', authorityProject: 'p', attemptId: '1', attemptNumber: 1, at: Date.parse('2026-11-03T12:00:00Z') };
+  assert.equal(invoke(['report', '--from', '2026-02-30', '--to', '2026-11-05']).status, 1);
+  assert.equal(fs.existsSync(s.state), false);
+  assert.equal(invoke(['report', '--from', '2026-11-02', '--to', '2026-11-05']).status, 1);
+  assert.equal(fs.existsSync(s.state), false);
+  const result = invoke(['ingest', '--source', 'tasks', '--format', 'json'], JSON.stringify(event));
+  assert.equal(result.status, 0, result.stderr); assert.equal(JSON.parse(result.stdout).replay, false);
+  const args = ['report', '--from', '2026-11-02', '--to', '2026-11-05'];
+  const filename = path.join(s.state, 'controller.sqlite'), before = fs.readFileSync(filename), mtime = fs.statSync(filename).mtimeMs;
+  const json = invoke([...args, '--format', 'json']); assert.equal(json.status, 0, json.stderr);
+  assert.equal(JSON.parse(json.stdout).observedFirstAcceptedTasks, 1);
+  assert.match(invoke(args).stdout, /Observed first accepted tasks: 1/);
+  assert.deepEqual(fs.readFileSync(filename), before); assert.equal(fs.statSync(filename).mtimeMs, mtime);
+  assert.deepEqual(fs.readdirSync(s.state), ['controller.sqlite']);
+  assert.equal(invoke(['report', '--from', '2026-02-30', '--to', '2026-11-05']).status, 1);
+  assert.equal(invoke(['ingest', '--source', 'tasks'], JSON.stringify({ ...event, raw: 'secret' })).status, 1);
 });

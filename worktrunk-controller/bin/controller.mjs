@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from 'node:path';
+import fs from 'node:fs';
 import { parseArgs } from 'node:util';
 import { loadConfig } from '../lib/config.mjs';
 import { Store } from '../lib/store.mjs';
@@ -7,19 +8,45 @@ import { invocation } from '../lib/invoke.mjs';
 import { enroll } from '../lib/identity.mjs';
 import { scanProject } from '../lib/observe.mjs';
 import { localPath } from '../lib/paths.mjs';
+import { ingest } from '../lib/events.mjs';
+import { report } from '../lib/report.mjs';
+
+function readEvent() {
+  const chunks = [], buffer = Buffer.alloc(4096);
+  let total = 0, size;
+  while ((size = fs.readSync(0, buffer, 0, buffer.length, null))) {
+    if ((total += size) > 65536) throw new Error('Event input exceeds 64 KiB');
+    chunks.push(Buffer.from(buffer.subarray(0, size)));
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+}
+
+function utcDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value ?? '')) throw new Error('Report dates must use YYYY-MM-DD in UTC');
+  const at = Date.parse(`${value}T00:00:00Z`);
+  if (!Number.isFinite(at) || new Date(at).toISOString().slice(0, 10) !== value) throw new Error('Invalid UTC report date');
+  return at;
+}
 
 try {
-  const { values, positionals } = parseArgs({ options: { config: { type: 'string' }, project: { type: 'string' }, path: { type: 'string' }, format: { type: 'string', default: 'text' } }, allowPositionals: true });
+  const { values, positionals } = parseArgs({ options: { config: { type: 'string' }, project: { type: 'string' }, path: { type: 'string' }, source: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, format: { type: 'string', default: 'text' } }, allowPositionals: true });
   const [command, ...extra] = positionals;
-  if (extra.length || !['scan', 'enroll'].includes(command) || !values.config || !['json', 'text'].includes(values.format)) throw new Error('Usage: node worktrunk-controller/bin/controller.mjs scan|enroll --config <absolute-file> [--project <id>] [--path <absolute-worktree>] [--format json|text]');
+  const allowed = { scan: ['project'], enroll: ['project', 'path'], ingest: ['source'], report: ['project', 'from', 'to'] };
+  if (extra.length || !Object.hasOwn(allowed, command) || !values.config || !['json', 'text'].includes(values.format)) throw new Error('Usage: node worktrunk-controller/bin/controller.mjs scan|enroll|ingest|report --config <absolute-file> [--project <id>] [--path <absolute-worktree>] [--source <id>] [--from YYYY-MM-DD --to YYYY-MM-DD] [--format json|text]');
+  if (Object.keys(values).some(key => !['config', 'format', ...allowed[command]].includes(key))) throw new Error('Option is not supported for this command');
   if ((command === 'enroll') !== Boolean(values.path) || (command === 'enroll' && !values.project)) throw new Error('Enrollment requires --project and --path; scan does not accept --path');
+  if (command === 'ingest' && !values.source) throw new Error('Ingestion requires a configured --source and one JSON event on stdin');
+  const window = command === 'report' ? { from: utcDate(values.from), to: utcDate(values.to) } : null;
+  if (window && (window.from >= window.to || window.to > Date.now())) throw new Error('Report window must have positive duration and end by now');
   const config = loadConfig(localPath(values.config));
   const projects = config.projects.filter(project => !values.project || values.project === project.id);
   if (!projects.length) throw new Error('No matching registered project');
-  const store = new Store(config.stateDir);
+  const store = new Store(config.stateDir, { readOnly: command === 'report' });
   try {
     let output;
-    if (command === 'enroll') {
+    if (command === 'ingest') output = ingest(config, store, values.source, readEvent());
+    else if (command === 'report') output = report({ ...config, projects }, store, window);
+    else if (command === 'enroll') {
       const project = projects[0];
       output = invocation(config, project.root, ({ git }) => {
         const root = localPath(values.path);
@@ -45,6 +72,13 @@ try {
     }
     if (values.format === 'json') process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     else if (command === 'enroll') process.stdout.write(`Enrolled ${output.path} (${output.id})\n`);
+    else if (command === 'ingest') process.stdout.write(`${output.replay ? 'Already recorded' : 'Recorded'} event ${output.id}\n`);
+    else if (command === 'report') {
+      process.stdout.write(`Observed first accepted tasks: ${output.observedFirstAcceptedTasks}\nFirst-attempt acceptance: ${output.firstAttemptOutcomes.accepted}/${output.firstAttemptOutcomes.total}; cancellations: ${output.firstAttemptOutcomes.cancelled}\n`);
+      for (const week of output.weeks) process.stdout.write(`  Week ${week.week}: ${week.observedFirstAcceptedTasks}\n`);
+      process.stdout.write(`Accepted task duration: median ${output.acceptedTaskDuration.medianMs ?? 'unavailable'} ms; p95 ${output.acceptedTaskDuration.p95Ms ?? 'unavailable'} ms; samples ${output.acceptedTaskDuration.samples}\n`);
+      for (const source of output.coverage) process.stdout.write(`  ${source.source}: ${source.status}; observed events ${source.observedEvents}\n`);
+    }
     else for (const project of output.projects) {
       process.stdout.write(`${project.project}: ${project.status ?? `${project.decisions.length} worktrees`}; apply disabled\n`);
       if (project.error) process.stdout.write(`  ${project.error}\n`);

@@ -39,6 +39,17 @@ export function loadConfig(filename) {
   for (const key of ['timeoutMs', 'maxFiles', 'maxBytes']) integer(limits[key], `limits.${key}`, 1);
   const artifactRoots = value.artifactRoots ?? [];
   if (!Array.isArray(artifactRoots)) throw new Error('artifactRoots must be an array');
-  const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, projects, stateDir, quarantineDir, policy, limits, artifactRoots };
+  const sourceIds = new Set(), instances = new Set();
+  if (value.eventSources !== undefined && !Array.isArray(value.eventSources)) throw new Error('eventSources must be an array');
+  const eventSources = (value.eventSources ?? []).map(source => {
+    object(source, 'event source');
+    const id = text(source.id, 'source.id'), instance = text(source.instance, 'source.instance');
+    if (sourceIds.has(id) || instances.has(instance)) throw new Error('Duplicate event source ID/instance');
+    sourceIds.add(id); instances.add(instance);
+    if (!['host', 'task'].includes(source.role)) throw new Error('Unsupported event source role');
+    if (!Array.isArray(source.projects) || !source.projects.length || source.projects.some(id => !ids.has(id)) || new Set(source.projects).size !== source.projects.length) throw new Error('Source projects must be registered and unique');
+    return { id, instance, role: source.role, projects: [...source.projects].sort(), authority: source.role === 'task' ? text(source.authority, 'source.authority') : null };
+  });
+  const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, projects, stateDir, quarantineDir, policy, limits, artifactRoots, eventSources };
   return { ...normalized, generation: digest(normalized) };
 }

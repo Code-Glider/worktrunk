@@ -35,6 +35,8 @@ jobs:
         run: node --test --test-timeout=20000 worktrunk-controller/tests/*.test.mjs
       - name: Native observation contract
         run: cargo test --locked --test integration test_list_controller
+      - name: Existing Claude hooks
+        run: cargo test --locked --test integration integration_tests::claude_hook
       - name: Schema contract
         run: cargo test --locked --bin wt commands::list::json_v2::tests
       - name: Documentation sync

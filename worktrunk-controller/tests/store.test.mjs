@@ -22,6 +22,22 @@ test('two independent writers never lose acknowledged commits', async t => {
   assert.equal(store.get('counter', 'one').value.n, 80);
 });
 
+test('opening state preserves journal mode while another connection reads', t => {
+  const directory = path.join(fixture(t), 'state');
+  const initial = new Store(directory);
+  initial.transaction(tx => tx.put('counter', 'one', { version: 1, n: 7 }));
+  initial.close();
+  const reader = new DatabaseSync(path.join(directory, 'controller.sqlite'));
+  reader.exec('PRAGMA journal_mode=DELETE; BEGIN;');
+  reader.prepare('SELECT * FROM records').all();
+  let store;
+  try {
+    store = new Store(directory);
+    assert.equal(store.db.prepare('PRAGMA journal_mode').get().journal_mode, 'delete');
+    assert.equal(store.get('counter', 'one').value.n, 7);
+  } finally { store?.close(); reader.exec('ROLLBACK'); reader.close(); }
+});
+
 test('killed transaction rolls back while preceding acknowledged commit survives', async t => {
   const storage_ = storage(t);
   const { state } = storage_;

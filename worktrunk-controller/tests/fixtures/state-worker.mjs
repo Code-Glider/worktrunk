@@ -1,10 +1,15 @@
 import fs from 'node:fs';
 import { Store } from '../../lib/store.mjs';
 import { enroll } from '../../lib/identity.mjs';
+import { ingest } from '../../lib/events.mjs';
 
 const [mode, directory, root, gitDir] = process.argv.slice(2);
 const store = new Store(directory);
-if (mode === 'increment') {
+if (mode === 'events') {
+  const config = { eventSources: [{ id: 'host', instance: 'host-1', role: 'host', projects: ['p'], authority: null }] };
+  for (let i = 0; i < 20; i++) ingest(config, store, 'host', { version: 1, eventId: `${root}-${i}`, project: 'p', type: 'working', sessionId: root });
+  console.log('20 events committed');
+} else if (mode === 'increment') {
   for (let i = 0; i < 40; i++) store.transaction(tx => tx.put('counter', 'one', { version: 1, n: (tx.get('counter', 'one')?.value.n ?? 0) + 1 }));
   console.log('40 committed');
 } else if (mode === 'interrupt') {
