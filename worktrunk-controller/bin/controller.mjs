@@ -166,6 +166,7 @@ try {
       process.stdout.write(`Artifact purges: ${output.artifactPurges.observedActions} actions; ${output.artifactPurges.logicalBytes ?? 'unavailable'} logical bytes; ${output.artifactPurges.unavailableTimeActions} actions with unavailable time\n`);
       for (const action of output.actions) process.stdout.write(`  ${action.kind === 'worktree' ? `Worktree action ${action.id} (${action.project})` : `Action ${action.id}`}: ${action.phase}${action.purgeOutcome === 'interrupted' ? '; interrupted purge, remaining contents only' : ''}${action.error ? ` (${action.error})` : ''}\n`);
       for (const source of output.coverage) process.stdout.write(`  ${source.source}: ${source.status}; observed events ${source.observedEvents}\n`);
+      for (const read of output.githubIssueReads) process.stdout.write(`  GitHub issue #${read.issue} from ${JSON.stringify(read.source)} for ${JSON.stringify(read.project)} was last read successfully at ${new Date(read.observedAt).toISOString()}\n`);
     }
     else {
       for (const project of output.projects) {

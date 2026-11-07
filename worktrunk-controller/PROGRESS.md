@@ -400,3 +400,14 @@ Fresh critique. Persisted admission happens before the helper acknowledges that 
 - Ubuntu WSL passed all 54 focused tests on its native filesystem under Node 24.15.0. The first complete Windows run found one existing native fixture that expected admitted attempts to remain hidden. The updated fixture passed against a real gated Windows job, with no terminal outcome or verified completion exposed before exit.
 - Reviewed with ds-review-loop in two rounds by GPT-6 Astra (high), with verdict APPROVE and no review findings. The reviewer independently passed all 21 focused tests and checked admission time boundaries and acceptance without verified completion. The second round verified the updated native fixture's assertions and preserved admission and cleanup checks. The reviewed diff grew from 125 insertions and 11 deletions across six files to 131 insertions and 12 deletions across seven files before these evidence notes.
 - The final complete Windows controller rerun passed 142 tests with one expected platform skip and zero failures or cancellations in 378.4 seconds. This includes the native GitHub-bound launch, the scheduled disposable pilot, and the observation, quarantine, restore, purge and recovery fixtures. JavaScript syntax and Git whitespace checks passed.
+
+## Show saved GitHub issue reads in reports
+
+1. Sync an ordinary GitHub issue with no authoritative outcome, then read both report formats from the saved state. Check that the read timestamp is missing before the projection changes and that the read does not create a task, an attempt or an acceptance.
+2. Surface the saved successful-read evidence for current configured bindings and selected projects. Check failed refresh, older records without issue numbers, an as-of cutoff, and a changed binding. Verify that both report formats read SQLite without changing it.
+3. Run the focused and broader checks, review the change, and verify publication of the exact PR and WSL Gitea source revision.
+
+Review. The real adapter read and bulk-refreshed upstream issues 4709 and 4717 through authenticated GET requests. Neither had an authoritative outcome. Reuse the same snapshot eligibility check that the current outcome projection already uses. Report the last successful read and leave failed attempts in the sync command result. Keep task totals, throughput windows and the database schema independent of this display.
+
+- The regression failed on the missing JSON field before the change. The focused Windows suite passed all 22 tests. Ubuntu WSL passed all 55 related tests with Node 24.15.0 on its native filesystem. The live GitHub probe showed both issue reads in JSON and text, with zero task outcomes and byte-identical SQLite state after reporting.
+- GPT-6 Astra (high) approved the change in one ds-review-loop round with no findings. The reviewer independently passed all 22 focused tests. JavaScript syntax and Git whitespace checks passed.

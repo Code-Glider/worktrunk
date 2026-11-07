@@ -193,7 +193,7 @@ node worktrunk-controller/bin/controller.mjs sync-github-issue --config <absolut
 node worktrunk-controller/bin/controller.mjs sync-github-issues --config <absolute-config.json> --format json
 ```
 
-Sync reads the selected issue through the authenticated GitHub CLI and stores normalized observations locally. The report shows the time of the last successful read. If a previously observed acceptance comment is edited or deleted, the next sync excludes it from current status and preserves the historical observation.
+Sync reads the selected issue through the authenticated GitHub CLI and stores normalized observations locally. Both report formats show the last successful read for saved issue numbers under the current source binding, even when an issue has no recorded acceptance, reopen or attempt. These read timestamps are independent of the throughput window. If a previously observed acceptance comment is edited or deleted, the next sync excludes it from current status and preserves the historical observation.
 
 The plural command refreshes issues already tracked by managed launches or saved issue numbers for configured sources. To include an issue synced by an older controller without a managed launch, sync it once by number. Each issue commits independently. Failed reads leave their last successful evidence intact, appear in the command result and cause a nonzero exit.
 

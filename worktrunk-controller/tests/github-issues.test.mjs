@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { digest } from '../lib/data.mjs';
 import { checkoutProducerFence, reserve, transition } from '../lib/admission.mjs';
 import { loadConfig } from '../lib/config.mjs';
@@ -69,6 +70,46 @@ test('syncs only explicit trusted acceptance, replays idempotently and reports n
   assert.equal(result.observedReopens, 1);
   assert.equal(result.coverage[0].status, 'partial_unmeasured');
   assert.equal(result.acceptedTaskDuration.samples, 0);
+});
+
+test('reports successful issue reads without creating tasks or refreshing evidence on failure', async t => {
+  const s = controller(t, process.execPath);
+  const raw = { ...JSON.parse(fs.readFileSync(s.filename)), eventSources: [source] };
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const config = loadConfig(s.filename);
+  const store = new Store(s.state);
+  let observedAt;
+  try {
+    const responses = { [repoPath]: repo, [issuePath]: issue, [timelinePath]: [[{ event: 'closed', id: 1 }]] };
+    const sync = () => syncGitHubIssue(config, store, 'github', 7, async endpoint => {
+      if (responses[endpoint] === undefined) throw new Error('Read unavailable');
+      return responses[endpoint];
+    });
+    assert.equal((await sync()).recorded, 0);
+    observedAt = store.list('github_issue')[0].value.observedAt;
+    delete responses[timelinePath];
+    await assert.rejects(sync(), /Read unavailable/);
+    store.transaction(tx => tx.put('github_issue', 'legacy', { version: 1, sourceInstance: source.instance, taskKey: 'legacy', observedAt }));
+    const from = Date.parse('2026-01-01'), to = Date.parse('2026-01-03');
+    assert.deepEqual(report(config, store, { from, to, now: observedAt - 1 }).githubIssueReads, []);
+    assert.deepEqual(report({ ...config, projects: [] }, store, { from, to }).githubIssueReads, []);
+    const changed = { ...config.eventSources[0], github: { ...source.github, acceptorIds: [6] } };
+    assert.deepEqual(report({ ...config, eventSources: [changed] }, store, { from, to }).githubIssueReads, []);
+  } finally { store.close(); }
+  const filename = path.join(s.state, 'controller.sqlite');
+  const before = fs.readFileSync(filename);
+  const invoke = format => {
+    const cli = path.resolve(import.meta.dirname, '../bin/controller.mjs');
+    const result = spawnSync(process.execPath, [cli, 'report', '--config', s.filename, '--from', '2026-01-01', '--to', '2026-01-03', '--format', format], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  const json = JSON.parse(invoke('json'));
+  assert.deepEqual(json.githubIssueReads, [{ source: 'github', project: 'myproject', issue: 7, observedAt }]);
+  assert.deepEqual(json.tasks, []);
+  assert.equal(json.observedFirstAcceptedTasks, 0);
+  assert.ok(invoke('text').includes(`GitHub issue #7 from "github" for "myproject" was last read successfully at ${new Date(observedAt).toISOString()}`));
+  assert.deepEqual(fs.readFileSync(filename), before);
 });
 
 test('a changed or deleted acceptance loses current status while preserving historical observations', async t => {

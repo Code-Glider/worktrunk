@@ -144,6 +144,15 @@ export function report(config, store, { from, to, now = Date.now() }) {
     const source = githubSources.get(row.value.sourceInstance);
     return source && digest(store.get('event_source', source.instance)?.value.source ?? null) === digest(source) && row.value.observedAt <= now;
   }).map(row => [row.value.taskKey, row.value]));
+  const githubIssueReads = [];
+  for (const { sourceInstance, issue, observedAt } of githubIssues.values()) {
+    const source = githubSources.get(sourceInstance);
+    const project = source.projects[0];
+    if (registered.has(project) && Number.isSafeInteger(issue) && issue > 0 && Number.isSafeInteger(observedAt) && observedAt >= 0) {
+      githubIssueReads.push({ source: source.id, project, issue, observedAt });
+    }
+  }
+  githubIssueReads.sort((a, b) => a.source.localeCompare(b.source) || a.issue - b.issue);
   const launches = new Map();
   for (const { value } of store.list('claim')) {
     const task = value.task;
@@ -218,7 +227,7 @@ export function report(config, store, { from, to, now = Date.now() }) {
     actions: actions.map(action => ({ id: action.id, ...(action.kind === 'worktree' ? { kind: action.kind, project: action.project } : { artifactId: action.artifactId }),
       phase: action.phase, originalPath: action.originalPath, payloadPath: action.payloadPath, createdAt: action.createdAt, quarantinedAt: action.quarantinedAt, purgedAt: action.purgedAt ?? null, purgeOutcome: action.purgeOutcome ?? null, error: action.error })),
     artifactPurges,
-    coverage: [...sourceMap.values()].map(source => sourceCoverage(source, allEvents)),
+    coverage: [...sourceMap.values()].map(source => sourceCoverage(source, allEvents)), githubIssueReads,
     unassociatedTaskEvents, unassociatedSessionEvents,
     observedFirstAcceptedTasks: acceptedTasks.length,
     weeks: [...cohorts].sort(([a], [b]) => a.localeCompare(b)).map(([week, observedFirstAcceptedTasks]) => ({ week, observedFirstAcceptedTasks })),
