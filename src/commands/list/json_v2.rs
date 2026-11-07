@@ -96,8 +96,47 @@ pub struct JsonEnvelope {
     /// Which gated fact families this run requested.
     pub collected: Collected,
 
+    /// Exact ref inventory and targets used by isolated controller analysis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation: Option<JsonObservation>,
+
     /// One entry per row, in table order.
     pub items: Vec<JsonItemV2>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct JsonObservation {
+    pub refs: BTreeMap<String, String>,
+    pub targets: BTreeMap<String, String>,
+}
+
+impl JsonObservation {
+    fn from_snapshot(
+        snapshot: &worktrunk::git::RefSnapshot,
+        targets: &worktrunk::git::IntegrationTargets,
+    ) -> Option<Self> {
+        let refs = snapshot
+            .local_branches()
+            .iter()
+            .map(|branch| {
+                (
+                    format!("refs/heads/{}", branch.name),
+                    branch.commit_sha.clone(),
+                )
+            })
+            .chain(snapshot.remote_branches().iter().map(|branch| {
+                (
+                    format!("refs/remotes/{}", branch.short_name),
+                    branch.commit_sha.clone(),
+                )
+            }))
+            .collect();
+        let targets = std::iter::once(&targets.primary)
+            .chain(targets.secondary.iter())
+            .map(|name| Some((name.clone(), snapshot.resolve(name)?.to_owned())))
+            .collect::<Option<BTreeMap<_, _>>>()?;
+        Some(Self { refs, targets })
+    }
 }
 
 /// The published JSON Schema for [`JsonEnvelope`], as a JSON value.
@@ -538,6 +577,8 @@ pub fn to_json_envelope(
     custom_columns: &[ResolvedCustomColumn],
     repo: &Repository,
     collected: Collected,
+    snapshot: Option<&worktrunk::git::RefSnapshot>,
+    integration_targets: Option<&worktrunk::git::IntegrationTargets>,
 ) -> JsonEnvelope {
     let mut all_vars = repo.all_vars_from_snapshot().unwrap_or_default();
     let default_branch = repo.default_branch();
@@ -557,7 +598,13 @@ pub fn to_json_envelope(
         })
         .collect();
 
-    envelope_with_items(repo, default_branch, collected, json_items)
+    let mut envelope = envelope_with_items(repo, default_branch, collected, json_items);
+    if worktrunk::controller::active() {
+        envelope.observation = snapshot
+            .zip(integration_targets)
+            .and_then(|(snapshot, targets)| JsonObservation::from_snapshot(snapshot, targets));
+    }
+    envelope
 }
 
 /// Wrap pre-built items in the envelope. Used directly by the statusline
@@ -582,6 +629,7 @@ pub fn envelope_with_items(
             forge: repo.repo_info(),
         },
         collected,
+        observation: None,
         items,
     }
 }
@@ -1614,6 +1662,10 @@ mod tests {
                 }),
             },
             collected,
+            observation: Some(JsonObservation {
+                refs: [("refs/heads/main".to_string(), "a".repeat(40))].into(),
+                targets: [("main".to_string(), "a".repeat(40))].into(),
+            }),
             items,
         };
 
@@ -1648,6 +1700,7 @@ mod tests {
             ),
             ("JsonItemV2", "/items/*"),
             ("JsonMainState", "/items/*/display/state"),
+            ("JsonObservation", "/observation"),
             ("JsonOperation", "/items/*/worktree/operation"),
             ("JsonPr", "/items/*/pr"),
             ("JsonReason", "/items/*/worktree/locked"),
@@ -1708,6 +1761,7 @@ mod tests {
                 ci: false,
                 summary: false,
             },
+            observation: None,
             items: vec![],
         };
         assert_snapshot!(serde_json::to_string_pretty(&envelope).unwrap(), @r#"

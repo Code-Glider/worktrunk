@@ -1152,16 +1152,22 @@ impl<'a> WorkingTree<'a> {
         builder.prefix(TEMP_INDEX_PREFIX);
         // Parallel probes don't wait for the one caller doing this sweep.
         static SWEPT_SYSTEM_TEMP: AtomicBool = AtomicBool::new(false);
-        if !SWEPT_SYSTEM_TEMP.swap(true, Ordering::Relaxed) {
-            sweep_stale_temp_indexes(&std::env::temp_dir());
-        }
-        let mut temp_file = match builder.tempfile() {
-            Ok(file) => file,
-            Err(temp_error) => {
-                sweep_stale_temp_indexes(&git_dir);
-                builder.tempfile_in(&git_dir).context(format!(
-                    "Failed to create temporary index in the system temp directory or Git directory; system temp error: {temp_error}"
-                ))?
+        let mut temp_file = if let Some(scratch) = crate::controller::scratch_directory()? {
+            builder
+                .tempfile_in(scratch)
+                .context("Failed to create controller temporary index")?
+        } else {
+            if !SWEPT_SYSTEM_TEMP.swap(true, Ordering::Relaxed) {
+                sweep_stale_temp_indexes(&std::env::temp_dir());
+            }
+            match builder.tempfile() {
+                Ok(file) => file,
+                Err(temp_error) => {
+                    sweep_stale_temp_indexes(&git_dir);
+                    builder.tempfile_in(&git_dir).context(format!(
+                        "Failed to create temporary index in the system temp directory or Git directory; system temp error: {temp_error}"
+                    ))?
+                }
             }
         };
         let mut real_index_file = match std::fs::File::open(&real_index) {

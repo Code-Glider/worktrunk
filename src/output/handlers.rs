@@ -63,16 +63,22 @@ use super::shell_integration::{
 /// `Progress::start`) or when verbosity ≥ 1 (verbose mode prefers structured
 /// output over live updates). The walk itself is best-effort — see
 /// [`remove_dir_with_progress`].
-fn cleanup_staged_with_progress(staged: &Path) -> (usize, u64) {
+fn cleanup_staged_with_progress(staged: &Path) -> anyhow::Result<(usize, u64)> {
     let progress = if verbosity() >= 1 {
         Progress::disabled()
     } else {
         Progress::start("Removing")
     };
-    remove_dir_with_progress(staged, &progress);
+    let removed = remove_dir_with_progress(staged, &progress);
     let totals = progress.totals();
     progress.finish();
-    totals
+    if worktrunk::controller::active() && !removed {
+        anyhow::bail!(
+            "Selected worktree teardown completed but staged content remains @ {}",
+            staged.display()
+        );
+    }
+    Ok(totals)
 }
 
 // ============================================================================
@@ -1918,6 +1924,8 @@ fn handle_detached_removed_worktree_output(
             .staged_path
             .as_deref()
             .map(cleanup_staged_with_progress)
+            .transpose()
+            .map_err(|error| CommandFailure::with_result(error, BranchFate::NotAttempted))?
             .unwrap_or((0, 0));
         let stats_paren = format_stats_paren(files, bytes);
         eprintln!(
@@ -1996,14 +2004,17 @@ fn handle_named_removed_worktree_foreground(
             force_worktree: ctx.force_worktree,
         },
     )?;
+    // Teardown has already happened even if deleting the staged contents fails.
+    let fate = BranchFate::from_result(output.branch_result.as_ref());
     let stats = output
         .staged_path
         .as_deref()
         .map(cleanup_staged_with_progress)
+        .transpose()
+        .map_err(|error| CommandFailure::with_result(error, fate))?
         .unwrap_or((0, 0));
 
     // The worktree is gone even when branch deletion or hook setup failed.
-    let fate = BranchFate::from_result(output.branch_result.as_ref());
     let finish = (|| -> anyhow::Result<()> {
         spawn_hooks_after_remove(repo, ctx, Some(branch_name), announcer)?;
 

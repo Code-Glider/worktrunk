@@ -912,11 +912,15 @@ impl Repository {
         let alternate = self.object_database_path();
         let mut builder = tempfile::Builder::new();
         builder.prefix("worktrunk-list-objects-");
-        let directory = match builder.tempdir() {
-            Ok(directory) => directory,
-            Err(temp_error) => builder.tempdir_in(&self.git_common_dir).context(format!(
-                "Failed to create temporary object database in the system temp directory or Git common directory; system temp error: {temp_error}"
-            ))?,
+        let directory = match crate::controller::scratch_directory()? {
+            Some(scratch) => builder.tempdir_in(scratch)
+                .context("Failed to create controller temporary object database")?,
+            None => match builder.tempdir() {
+                Ok(directory) => directory,
+                Err(temp_error) => builder.tempdir_in(&self.git_common_dir).context(format!(
+                    "Failed to create temporary object database in the system temp directory or Git common directory; system temp error: {temp_error}"
+                ))?,
+            },
         };
         let alternates = alternate_object_directories(&alternate);
         let registered_path = directory.path().to_path_buf();
@@ -1825,6 +1829,9 @@ impl Repository {
     /// indefinitely. `read_to_end()` in `Command::output()` then blocks forever
     /// waiting for EOF that never comes.
     pub fn start_fsmonitor_daemon_at(&self, path: &Path) {
+        if crate::controller::active() {
+            return;
+        }
         #[cfg(unix)]
         if let Ok(git_dir) = self.worktree_at(path).git_dir()
             && socket2::SockAddr::unix(git_dir.join(super::fsmonitor::IPC_SOCKET_NAME))

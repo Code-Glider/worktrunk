@@ -195,6 +195,8 @@ pub fn handle_list(
         items,
         custom_columns,
         collected,
+        snapshot,
+        integration_targets,
     }) = list_data
     else {
         return Ok(());
@@ -208,6 +210,8 @@ pub fn handle_list(
             &custom_columns,
             &repo,
             collected,
+            snapshot.as_deref(),
+            integration_targets.as_ref(),
         ))?,
         Some(_) => print_json(&json_output::to_json_items(&items, &custom_columns, &repo))?,
     }

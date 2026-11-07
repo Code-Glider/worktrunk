@@ -7,6 +7,7 @@ mod approvals;
 mod codex;
 mod create;
 mod hints;
+mod observer;
 mod omp;
 pub mod opencode;
 mod pi;

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "host": { "id": "replace-with-native-host-id", "platform": "win32" },
+  "registry": "C:/controller-config/projects.json",
+  "stateDir": "C:/controller-state",
+  "quarantineDir": "C:/controller-quarantine",
+  "worktrunk": {
+    "path": "C:/worktrunk/target/release/wt.exe",
+    "sha256": "replace-with-the-executable-sha256",
+    "version": "0.81.0",
+    "schema": 2
+  },
+  "policy": {
+    "generation": 1,
+    "minAgeMs": 86400000,
+    "retentionMs": 604800000,
+    "allowApply": false,
+    "deleteBranches": false
+  },
+  "limits": { "timeoutMs": 10000, "maxFiles": 100000, "maxBytes": 1073741824 },
+  "artifactRoots": [],
+  "eventSources": []
+}

@@ -162,6 +162,19 @@ impl<'a> HookPlanBuilder<'a> {
 }
 
 impl HookPlan {
+    /// Automatic removal cannot admit arbitrary writers, including approved hooks.
+    pub fn require_no_commands(&self) -> anyhow::Result<()> {
+        if self.entries.iter().any(|entry| {
+            entry
+                .selection
+                .iter()
+                .any(|(_, cfg)| cfg.commands().next().is_some())
+        }) {
+            anyhow::bail!("Controller removal refuses hooks");
+        }
+        Ok(())
+    }
+
     /// The project-source templates the prompt must show, deduped by template
     /// so the same command across several anchors prompts once (the common
     /// case: every removal in a batch lands in the same primary worktree).

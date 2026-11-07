@@ -381,6 +381,13 @@ pub fn remove_worktree_with_cleanup(
     worktree_path: &Path,
     options: RemoveOptions,
 ) -> anyhow::Result<RemovalOutput> {
+    if crate::controller::active()
+        && (options.force_worktree
+            || !options.deletion_mode.should_keep()
+            || options.branch.is_none())
+    {
+        anyhow::bail!("Controller removal requires a retained branch and refuses force");
+    }
     let staged_path = stage_worktree_removal(
         repo,
         worktree_path,
@@ -388,6 +395,11 @@ pub fn remove_worktree_with_cleanup(
         options.force_worktree,
     )?;
     if staged_path.is_none() {
+        if crate::controller::active() {
+            anyhow::bail!(
+                "Controller removal could not stage the selected worktree; direct fallback is refused"
+            );
+        }
         repo.remove_worktree(worktree_path, options.force_worktree)?;
     }
 
@@ -503,6 +515,28 @@ pub fn stage_worktree_removal(
         .into());
     }
 
+    if crate::controller::active() {
+        if force_worktree {
+            anyhow::bail!("Controller removal refuses force");
+        }
+        require_controller_preservation(repo, worktree_path, branch)?;
+        crate::controller::require_local_directory(&git_dir)?;
+        let trash = repo.wt_trash_dir();
+        for ancestor in trash.ancestors() {
+            match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    crate::controller::require_local_directory(ancestor)?;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("Failed to inspect controller trash"),
+            }
+        }
+        fs::create_dir_all(&trash)?;
+        crate::controller::require_local_directory(&trash)?;
+        return rename_into_trash(repo, worktree_path, &git_dir);
+    }
+
     if force_worktree {
         // Disclosure does not veto the force removal, but an interrupted
         // status command still cancels before any directory is removed.
@@ -550,7 +584,141 @@ pub fn stage_worktree_removal(
         worktree.ensure_clean_without_fsmonitor("remove worktree", branch, true)?;
     }
 
-    Ok(rename_into_trash(repo, worktree_path, &git_dir))
+    rename_into_trash(repo, worktree_path, &git_dir)
+}
+
+/// Final raw-byte preservation gate; callers must also exclude cooperative writers.
+fn require_controller_preservation(
+    repo: &Repository,
+    path: &Path,
+    branch: Option<&str>,
+) -> anyhow::Result<()> {
+    crate::controller::require_local_directory(path)?;
+    crate::controller::require_callback_free(path)?;
+    let wt = repo.worktree_at(path);
+    let branch = branch.context("Controller removal requires a reachable retained branch")?;
+    let reference = format!("refs/heads/{branch}");
+    if wt.run_command(&["symbolic-ref", "--quiet", "HEAD"])?.trim() != reference {
+        anyhow::bail!("Controller removal branch changed");
+    }
+    wt.ensure_clean_without_fsmonitor("remove worktree", Some(branch), false)?;
+    let staged = wt.run_command_output(&[
+        "diff",
+        "--cached",
+        "--quiet",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "HEAD",
+        "--",
+    ])?;
+    if !staged.status.success() {
+        anyhow::bail!("Controller removal requires an unchanged index");
+    }
+    let flags = wt.run_command_bytes(&["ls-files", "-v", "-z"])?;
+    if flags
+        .split(|&b| b == 0)
+        .filter(|r| !r.is_empty())
+        .any(|r| !r.starts_with(b"H "))
+    {
+        anyhow::bail!("Controller removal refuses hidden index entries");
+    }
+    let index = wt.run_command_bytes(&["ls-files", "--stage", "-z"])?;
+    let mut files = Vec::new();
+    let mut allowed = HashSet::new();
+    allowed.insert(PathBuf::from(".git"));
+    for record in index.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let tab = record
+            .iter()
+            .position(|&b| b == b'\t')
+            .context("Malformed controller index entry")?;
+        let header = std::str::from_utf8(&record[..tab])?
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>();
+        if header.len() != 3 || !matches!(header[0], "100644" | "100755") || header[2] != "0" {
+            anyhow::bail!("Controller removal refuses unsupported index entries");
+        }
+        let relative = super::git_path_from_bytes(&record[tab + 1..])?;
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            anyhow::bail!("Controller removal refuses non-local index paths");
+        }
+        for ancestor in relative.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+            allowed.insert(ancestor.to_path_buf());
+        }
+        files.push((relative, header[1].to_string()));
+    }
+    let mut pending = vec![path.to_path_buf()];
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let full = entry.path();
+            let relative = full.strip_prefix(path)?;
+            let metadata = fs::symlink_metadata(&full)?;
+            entries += 1;
+            bytes = bytes.saturating_add(metadata.len());
+            if entries > 100_000 || bytes > 1024 * 1024 * 1024 {
+                anyhow::bail!("Controller removal content exceeds preservation bounds");
+            }
+            if !allowed.contains(relative) || (!metadata.is_file() && !metadata.is_dir()) {
+                anyhow::bail!("Controller removal refuses ignored, untracked or linked content");
+            }
+            if metadata.is_dir() {
+                pending.push(full);
+            }
+        }
+    }
+    // Read and rehash retained blobs; object headers alone can hide corruption.
+    let mut verified = HashSet::new();
+    for batch in files.chunks(32) {
+        for (_, oid) in batch {
+            if !verified.insert(oid) {
+                continue;
+            }
+            let (stored, hashed) = Cmd::new("git")
+                .current_dir(path)
+                .scrub_git_discovery_env()
+                .args(["cat-file", "blob", oid])
+                .pipe_into(
+                    Cmd::new("git")
+                        .current_dir(path)
+                        .scrub_git_discovery_env()
+                        .args(["hash-object", "--stdin"]),
+                )?;
+            if !stored.status.success()
+                || !hashed.status.success()
+                || std::str::from_utf8(&hashed.stdout)?.trim() != oid
+            {
+                anyhow::bail!("Controller removal requires intact retained local Git blobs");
+            }
+        }
+        // No filters/stat-cache trust; transformed checkouts conservatively retain.
+        let output = Cmd::new("git")
+            .current_dir(path)
+            .scrub_git_discovery_env()
+            .args(["hash-object", "--no-filters", "--"])
+            .args(batch.iter().map(|(relative, _)| path.join(relative)))
+            .run()?;
+        if !output.status.success() {
+            anyhow::bail!("Failed to hash controller worktree content");
+        }
+        let hashes = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .collect::<Vec<_>>();
+        if hashes.len() != batch.len()
+            || hashes
+                .iter()
+                .zip(batch)
+                .any(|(actual, (_, expected))| actual != expected)
+        {
+            anyhow::bail!("Controller removal content differs from retained Git objects");
+        }
+    }
+    Ok(())
 }
 
 /// Find a registered worktree contained in `worktree_path`, using a fresh
@@ -610,25 +778,61 @@ pub fn require_no_nested_worktrees(repo: &Repository, worktree_path: &Path) -> a
 /// sweeping the repository, so a sibling worktree whose directory happens to
 /// be absent right now keeps its registration. A locked worktree never reaches
 /// here — [`stage_worktree_removal`] rejects one before the rename.
-fn rename_into_trash(repo: &Repository, worktree_path: &Path, git_dir: &Path) -> Option<PathBuf> {
+fn rename_into_trash(
+    repo: &Repository,
+    worktree_path: &Path,
+    git_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
     let trash_dir = repo.wt_trash_dir();
     let _ = std::fs::create_dir_all(&trash_dir);
-    let staged_path = generate_removing_path(&trash_dir, git_dir);
-
-    if std::fs::rename(worktree_path, &staged_path)
-        .inspect_err(|e| {
-            tracing::debug!(error = %e, "Failed to stage worktree into trash, falling back: {e}");
+    // An exclusively created container prevents rename from replacing unrelated trash.
+    let container = crate::controller::active()
+        .then(|| {
+            tempfile::Builder::new()
+                .prefix("controller-")
+                .suffix(".pending")
+                .tempdir_in(&trash_dir)
+                .map(|dir| dir.keep())
         })
-        .is_ok()
-    {
-        // The rename moved the directory out from under `worktree_path`,
-        // leaving its registration stale for the prune to delete.
-        if let Err(e) = repo.prune_worktree_entry(worktree_path) {
-            tracing::debug!(error = %e, "Failed to prune worktree entry after rename: {e}");
+        .transpose()?;
+    let staged_path = container
+        .as_ref()
+        .map(|dir| dir.join("worktree"))
+        .unwrap_or_else(|| generate_removing_path(&trash_dir, git_dir));
+
+    match std::fs::rename(worktree_path, &staged_path) {
+        Ok(()) => {
+            let cleanup_path = container.unwrap_or(staged_path);
+            // The rename moved the directory out from under `worktree_path`,
+            // leaving its registration stale for the prune to delete.
+            if let Err(e) = repo.prune_worktree_entry(worktree_path) {
+                if crate::controller::active() {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Selected worktree staged @ {}; registration cleanup failed",
+                            cleanup_path.display()
+                        )
+                    });
+                }
+                tracing::debug!(error = %e, "Failed to prune worktree entry after rename: {e}");
+            }
+            Ok(Some(cleanup_path))
         }
-        Some(staged_path)
-    } else {
-        None
+        Err(error) => {
+            if let Some(container) = container {
+                std::fs::remove_dir(&container).with_context(|| {
+                    format!(
+                        "Failed to remove unused controller staging @ {}",
+                        container.display()
+                    )
+                })?;
+                return Err(error).context(
+                    "Controller could not stage the selected worktree; direct fallback is refused",
+                );
+            }
+            tracing::debug!(error = %error, "Failed to stage worktree into trash, falling back: {error}");
+            Ok(None)
+        }
     }
 }
 

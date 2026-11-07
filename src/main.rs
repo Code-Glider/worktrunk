@@ -1162,6 +1162,10 @@ fn main() {
     // WORKTRUNK_TEST_MOCK_CONFIG_DIR; see `worktrunk::testing::mock_stub`.
     worktrunk::testing::mock_stub::maybe_run();
 
+    if let Err(error) = worktrunk::controller::scratch_directory() {
+        handle_command_failure(error, 0, "wt");
+    }
+
     // Initialize the Unix signal-receiving process owner before other threads
     // exist, and capture startup state: the working directory
     // (used by shell_exec to resolve relative `GIT_*` path variables

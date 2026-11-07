@@ -500,6 +500,9 @@ impl Repository {
                 if let Some(branch) = configured {
                     return Some(branch);
                 }
+                if crate::controller::active() {
+                    return None;
+                }
 
                 // Detect: try remote, then local inference
                 let remote = self.detect_from_remote();
