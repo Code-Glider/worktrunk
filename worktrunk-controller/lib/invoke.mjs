@@ -14,17 +14,26 @@ export function isolatedEnvironment(scratch, inherited = process.env) {
   return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: emptyGit, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_ALLOW_PROTOCOL: '', WORKTRUNK_CONFIG_PATH: emptyWt, WORKTRUNK_SYSTEM_CONFIG_PATH: emptyWt, WORKTRUNK_PROJECT_CONFIG_PATH: '', WORKTRUNK_APPROVALS_PATH: path.join(scratch, 'approvals.toml'), WORKTRUNK_CONTROLLER_SCRATCH: scratch, NO_COLOR: '1' };
 }
 
-export function invocation(config, root, fn) {
-  root = localPath(root);
+export function openInvocation(config) {
   const parent = localPath(path.join(config.stateDir, 'invocations'), { missing: true });
   fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
   localPath(parent);
   const scratch = fs.mkdtempSync(path.join(parent, 'scan-'));
   const identity = fileIdentity(scratch);
+  const dispose = () => { if (digest(identity) === digest(fileIdentity(scratch))) fs.rmSync(localPath(scratch), { recursive: true }); };
+  return { scratch, env: isolatedEnvironment(scratch), dispose };
+}
+
+export function isolatedGitArgs(scratch, args) {
+  return ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${path.join(scratch, 'hooks-disabled')}`, ...args];
+}
+
+export function invocation(config, root, fn) {
+  root = localPath(root);
+  const { scratch, env, dispose } = openInvocation(config);
   let completed = false;
   let probeFailed = false;
   try {
-    const env = isolatedEnvironment(scratch);
     function run(program, args, cwd = root) {
       const output = spawnSync(program, args, { cwd: localPath(cwd), env, windowsHide: true, timeout: config.limits.timeoutMs, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
       if (output.error || output.status !== 0) {
@@ -33,7 +42,7 @@ export function invocation(config, root, fn) {
       }
       return new TextDecoder('utf-8', { fatal: true }).decode(output.stdout);
     }
-    const git = (args, cwd = root) => run('git', ['-c', 'core.fsmonitor=false', '-c', `core.hooksPath=${path.join(scratch, 'hooks-disabled')}`, ...args], cwd);
+    const git = (args, cwd = root) => run('git', isolatedGitArgs(scratch, args), cwd);
     const wt = args => {
       const filename = localPath(config.worktrunk.path);
       const hash = () => createHash('sha256').update(fs.readFileSync(filename)).digest('hex');
@@ -51,7 +60,7 @@ export function invocation(config, root, fn) {
     return result;
   } finally {
     // Failed/expired probes retain their private scratch for explicit recovery.
-    if (completed && !probeFailed && digest(identity) === digest(fileIdentity(scratch))) fs.rmSync(localPath(scratch), { recursive: true });
+    if (completed && !probeFailed) dispose();
   }
 }
 

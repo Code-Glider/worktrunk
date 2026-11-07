@@ -5,11 +5,14 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { digest, integer, text } from './data.mjs';
 import { fileIdentity, localPath } from './paths.mjs';
-import { acquireCleanup } from './admission.mjs';
+import { acquireCleanup, holdsWorktreeRepository } from './admission.mjs';
 import { inspectArtifact } from './artifacts.mjs';
 import { loadConfig } from './config.mjs';
 import { syncGitHubIssueSnapshot } from './events.mjs';
 import { managedCheckout } from './managed.mjs';
+import { recordRelocation } from './identity.mjs';
+import { invocation, isolatedGitArgs, openInvocation } from './invoke.mjs';
+import { readCommandCompletion, runJournaledCommand } from './native-host.mjs';
 import { scanProject } from './observe.mjs';
 import { sampleClock, retentionStatus } from './retention.mjs';
 import { maxIssueAgeMs } from './worktree-evidence.mjs';
@@ -26,7 +29,7 @@ function at(filename) {
 function read(config, tx, id, kind = 'artifact') {
   const action = tx.get('action', text(id, 'action ID'))?.value;
   if (!action || action.kind !== kind || action.id !== id || !/^[a-f0-9-]{36}$/.test(id) || action.owner !== config.host.id || action.domain !== process.platform) throw new Error(`Matching owned ${kind} action required`);
-  if (!['intent', 'prepared', 'quarantined', 'restoring', 'restored', 'cancelled', 'purging', 'purged'].includes(action.phase)) throw new Error('Unsupported action phase');
+  if (!['intent', 'prepared', 'moving', 'moved', 'quarantined', 'restoring', 'restored', 'cancelled', 'purging', 'purged'].includes(action.phase)) throw new Error('Unsupported action phase');
   if (action.quarantineRoot !== config.quarantineDir || action.containerPath !== path.join(config.quarantineDir, id) || action.payloadPath !== path.join(action.containerPath, 'payload')) throw new Error('Quarantine boundary does not match manifest');
   const claim = tx.get('claim', action.claimToken)?.value;
   if (!claim || claim.actionId !== id || claim.token !== action.claimToken || claim.kind !== 'cleanup' || claim.owner !== action.owner || claim.roots.length !== 1 || claim.roots[0].path !== action.originalPath || !same(claim.roots[0].incarnation, action.incarnation) || claim.state !== (terminal.has(action.phase) ? 'released' : 'held')) throw new Error('Action ownership claim unavailable');
@@ -54,7 +57,7 @@ function location(action) {
 function complete(tx, action, claim, phase) {
   const next = { ...action, phase, error: null };
   tx.put('action', action.id, next);
-  tx.put('claim', claim.token, { ...claim, state: terminal.has(phase) ? 'released' : 'held', roots: [{ path: action.originalPath, incarnation: action.incarnation, ...(['quarantined', 'purging'].includes(phase) ? { currentPath: action.payloadPath } : {}) }] });
+  tx.put('claim', claim.token, { ...claim, state: terminal.has(phase) ? 'released' : 'held', roots: [{ path: action.originalPath, incarnation: action.incarnation, ...(['moved', 'quarantined', 'purging'].includes(phase) ? { currentPath: action.payloadPath } : {}) }] });
   return next;
 }
 
@@ -84,6 +87,16 @@ function beginQuarantine(config, store, selected, id, now, details) {
   return store.get('action', id).value;
 }
 
+function prepareQuarantine(tx, action) {
+  if (action.phase !== 'intent' || location(action) !== 'original') throw new Error('Quarantine intent is no longer pending');
+  try { fs.mkdirSync(action.quarantineRoot, { mode: 0o700 }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const quarantineIdentity = fileIdentity(action.quarantineRoot);
+  if (!fs.statSync(action.quarantineRoot).isDirectory() || quarantineIdentity.dev !== action.incarnation.dev) throw new Error('Quarantine must be a directory on the same filesystem');
+  fs.mkdirSync(action.containerPath, { mode: 0o700 });
+  tx.put('action', action.id, { ...action, phase: 'prepared', quarantineIdentity, containerIdentity: fileIdentity(action.containerPath) });
+}
+
 function requireCurrentWorktreeConfig(config) {
   const current = loadConfig(config.configPath);
   if (current.generation !== config.generation || current.registryPath !== config.registryPath) throw new Error('Worktree configuration changed; scan again before applying');
@@ -102,7 +115,7 @@ export function beginWorktreeAction(config, store, decisionId) {
   return beginQuarantine(config, store, selected, randomUUID(), Date.now(), (tx, originalPath) => {
     const checkout = managedCheckout(config, tx, project, originalPath, true);
     if (checkout.head !== selected.head || checkout.worktreeId !== selected.evidence.identity || !same(checkout.repositoryIncarnation, selected.evidence.repositoryIncarnation)) throw new Error('Worktree decision identity changed; scan again before applying');
-    if (tx.list('action').some(({ value }) => value.kind === 'worktree' && value.phase === 'intent' && same(value.repositoryIncarnation, checkout.repositoryIncarnation))) throw new Error('A pending worktree action owns this repository');
+    if (tx.list('action').some(({ value }) => holdsWorktreeRepository(value) && same(value.repositoryIncarnation, checkout.repositoryIncarnation))) throw new Error('A pending worktree action owns this repository');
     const { sourceInstance, issue } = selected.evidence.taskEvidence;
     const issueKey = digest([sourceInstance, issue]);
     const initialIssueRevision = tx.get('github_issue', issueKey)?.revision;
@@ -114,7 +127,9 @@ export function beginWorktreeAction(config, store, decisionId) {
 function pendingWorktree(config, store, actionId) {
   const owned = read(config, store, actionId, 'worktree');
   const { action } = owned;
-  if (action.phase !== 'intent' || action.containerIdentity !== null || action.quarantineIdentity !== null || location(action) !== 'original') throw new Error('Unstarted worktree intent required');
+  if (!['intent', 'prepared'].includes(action.phase) || action.command ||
+      (action.phase === 'prepared' ? !action.containerIdentity || !action.quarantineIdentity : action.containerIdentity !== null || action.quarantineIdentity !== null) ||
+      location(action) !== 'original') throw new Error('Unstarted worktree intent required');
   return owned;
 }
 
@@ -151,6 +166,47 @@ export function verifyWorktreeAction(config, tx, actionId, issueRevision) {
   return fresh;
 }
 
+function reconcileWorktreeMove(config, tx, action, claim) {
+  const receipt = readCommandCompletion(config, action.command.launch);
+  if (!receipt) throw new Error('Native worktree move completion unavailable');
+  const found = location(action);
+  const root = found === 'original' ? action.originalPath : action.payloadPath;
+  const project = config.projects.find(project => project.id === action.project);
+  if (!project) throw new Error('Worktree project unavailable during recovery');
+  if (found === 'payload') recordRelocation(tx, action.worktreeId, root, action.command.gitDir);
+  const checkout = managedCheckout(config, tx, project, root, true);
+  const registration = checkout.worktrees.find(entry => path.relative(root, entry.path) === '');
+  const expectedPaths = action.repositoryPaths.map(filename => filename === action.originalPath ? root : filename).sort();
+  if (!registration || registration.locked || (registration.branch ?? null) !== action.command.branch || checkout.head !== action.command.head ||
+      checkout.worktreeId !== action.worktreeId || !same(checkout.repositoryIncarnation, action.repositoryIncarnation) ||
+      !same(repositoryPaths(checkout), expectedPaths)) throw new Error('Worktree move registration differs from the admitted checkout');
+  return complete(tx, { ...action, moveExitCode: receipt.exitCode }, claim, found === 'payload' ? 'moved' : 'cancelled');
+}
+
+export async function moveWorktreeToQuarantine(config, store, decisionId, request) {
+  const intent = beginWorktreeAction(config, store, decisionId);
+  const id = intent.id;
+  try {
+    const issueRevision = await refreshWorktreeAuthority(config, store, id, request);
+    const project = config.projects.find(project => project.id === intent.project);
+    const program = invocation(config, project.root, ({ git }) => localPath(path.join(git(['--exec-path']).trim(), 'git.exe')));
+    const programIdentity = fileIdentity(program);
+    store.transaction(tx => prepareQuarantine(tx, read(config, tx, id, 'worktree').action));
+    const scope = openInvocation(config);
+    await runJournaledCommand(config, store, { root: project.root, program, env: scope.env,
+      args: isolatedGitArgs(scope.scratch, ['worktree', 'move', '--', intent.originalPath, intent.payloadPath]) }, (tx, launch) => {
+      const fresh = verifyWorktreeAction(config, tx, id, issueRevision);
+      const { action } = read(config, tx, id, 'worktree');
+      if (action.phase !== 'prepared' || !same(fileIdentity(program), programIdentity)) throw new Error('Worktree move preparation changed');
+      tx.put('action', id, { ...action, phase: 'moving', command: { launch, head: fresh.head, branch: fresh.branch, gitDir: fresh.evidence.gitDir } });
+    });
+    const moved = reconcile(config, store, id);
+    scope.dispose();
+    if (moved.phase !== 'moved' || moved.moveExitCode !== 0) throw new Error('Git worktree move did not succeed');
+    return moved;
+  } catch (error) { return failed(config, store, id, error); }
+}
+
 export function quarantineArtifact(config, store, decisionId, now = Date.now()) {
   integer(now, 'action time', 1);
   if (!config.policy.allowApply) throw new Error('Apply is disabled by policy');
@@ -159,16 +215,7 @@ export function quarantineArtifact(config, store, decisionId, now = Date.now()) 
   const id = randomUUID();
   try {
     beginQuarantine(config, store, selected, id, now, () => ({ artifactId: selected.artifactId, projects: selected.projects }));
-    store.transaction(tx => {
-      const { action } = read(config, tx, id);
-      if (action.phase !== 'intent' || location(action) !== 'original') throw new Error('Quarantine intent is no longer pending');
-      try { fs.mkdirSync(action.quarantineRoot, { mode: 0o700 }); }
-      catch (error) { if (error.code !== 'EEXIST') throw error; }
-      const quarantineIdentity = fileIdentity(action.quarantineRoot);
-      if (!fs.statSync(action.quarantineRoot).isDirectory() || quarantineIdentity.dev !== action.incarnation.dev) throw new Error('Quarantine must be a directory on the same filesystem');
-      fs.mkdirSync(action.containerPath, { mode: 0o700 });
-      tx.put('action', id, { ...action, phase: 'prepared', quarantineIdentity, containerIdentity: fileIdentity(action.containerPath) });
-    });
+    store.transaction(tx => prepareQuarantine(tx, read(config, tx, id).action));
     return store.transaction(tx => {
       const { action, claim } = read(config, tx, id);
       if (action.phase !== 'prepared' || location(action) !== 'original') throw new Error('Quarantine is no longer prepared');
@@ -264,6 +311,8 @@ export function reconcile(config, store, actionId) {
       if (tx.get('action', text(actionId, 'action ID'))?.value.kind === 'worktree') {
         const owned = read(config, tx, actionId, 'worktree');
         if (owned.action.phase === 'cancelled') return owned.action;
+        if (owned.action.phase === 'moving') return reconcileWorktreeMove(config, tx, owned.action, owned.claim);
+        if (owned.action.phase === 'moved' && location(owned.action) === 'payload') return owned.action;
         const { action, claim } = pendingWorktree(config, tx, actionId);
         return complete(tx, action, claim, 'cancelled');
       }

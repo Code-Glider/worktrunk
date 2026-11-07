@@ -112,19 +112,19 @@ test('optional paths may disappear after lstat without hiding links or required-
   assert.throws(() => localPath(filename), { code: 'ENOENT' });
 });
 
-test('optional Windows UNKNOWN resolution requires independently confirmed disappearance', t => {
+for (const code of ['UNKNOWN', 'EPERM', 'EBADF']) test(`optional path resolution with ${code} requires independently confirmed disappearance`, t => {
   const s = setup(t), filename = path.join(s.base, 'transient-journal');
   const native = fs.realpathSync.native;
   let disappear = false;
   t.mock.method(fs.realpathSync, 'native', value => {
     if (value !== filename) return native(value);
     if (disappear) fs.unlinkSync(filename);
-    throw Object.assign(new Error('Windows journal resolution failed'), { code: 'UNKNOWN' });
+    throw Object.assign(new Error('Windows journal resolution failed'), { code });
   });
   fs.writeFileSync(filename, 'journal');
-  assert.throws(() => localPath(filename, { missing: true }), { code: 'UNKNOWN' });
+  assert.throws(() => localPath(filename, { missing: true }), { code });
   disappear = true;
   assert.equal(localPath(filename, { missing: true }), filename);
   fs.writeFileSync(filename, 'journal');
-  assert.throws(() => localPath(filename), { code: 'UNKNOWN' });
+  assert.throws(() => localPath(filename), { code });
 });

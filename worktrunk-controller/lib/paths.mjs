@@ -32,7 +32,7 @@ export function localPath(value, { missing = false } = {}) {
   catch (error) {
     // SQLite can unlink a journal between the boundary checks and resolution.
     if (missing && error.code === 'ENOENT') return resolved;
-    if (missing && error.code === 'UNKNOWN') {
+    if (missing && ['UNKNOWN', 'EPERM', 'EBADF'].includes(error.code)) {
       try { fs.lstatSync(resolved); }
       catch (check) { if (check.code === 'ENOENT') return resolved; }
     }

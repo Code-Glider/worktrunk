@@ -15,6 +15,8 @@ struct Launch {
     cwd: std::path::PathBuf,
     program: std::path::PathBuf,
     args: Vec<String>,
+    #[serde(rename = "completionFile")]
+    completion_file: Option<std::path::PathBuf>,
 }
 
 #[cfg(windows)]
@@ -55,6 +57,17 @@ fn run() -> anyhow::Result<()> {
         || launch.args.iter().any(|arg| arg.contains('\0'))
     {
         bail!("Invalid native launch protocol");
+    }
+    if let Some(filename) = &launch.completion_file {
+        let expected = format!("{}.native-completion", launch.token);
+        if !filename.is_absolute() || filename.file_name() != Some(expected.as_ref()) {
+            bail!("Invalid native completion path");
+        }
+        match std::fs::symlink_metadata(filename) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => bail!("Native completion path already exists"),
+        }
     }
     contained_launch(launch, &mut input)
 }
@@ -109,9 +122,17 @@ fn contained_launch(launch: Launch, input: &mut impl BufRead) -> anyhow::Result<
         if job.query_process_id_list()? == [std::process::id() as usize] {
             let mut ended = evidence;
             ended["activeProcesses"] = 1.into();
-            return send(
-                serde_json::json!({ "version": 1, "type": "ended", "evidence": ended, "exitCode": status.code() }),
-            );
+            let message = serde_json::json!({ "version": 1, "type": "ended", "evidence": ended, "exitCode": status.code() });
+            if let Some(filename) = &launch.completion_file {
+                let parent = filename.parent().context("Missing completion parent")?;
+                let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+                serde_json::to_writer(&mut temp, &message)?;
+                temp.as_file().sync_all()?;
+                temp.persist_noclobber(filename)
+                    .map_err(|error| error.error)?;
+            }
+            // The controller may have exited while the command was running.
+            return send(message);
         }
         std::thread::sleep(Duration::from_millis(25));
     }

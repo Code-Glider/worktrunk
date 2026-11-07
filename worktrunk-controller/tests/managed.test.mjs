@@ -8,13 +8,14 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../lib/store.mjs';
-import { beginWorktreeAction, reconcile, refreshWorktreeAuthority, verifyWorktreeAction } from '../lib/actions.mjs';
+import { beginWorktreeAction, moveWorktreeToQuarantine, reconcile, refreshWorktreeAuthority, verifyWorktreeAction } from '../lib/actions.mjs';
 import { acquireCleanup, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
 import { enrollArtifact } from '../lib/artifacts.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { syncGitHubIssue } from '../lib/events.mjs';
 import { enroll } from '../lib/identity.mjs';
 import { runManaged } from '../lib/managed.mjs';
+import { readCommandCompletion, runJournaledCommand } from '../lib/native-host.mjs';
 import { scanProject } from '../lib/observe.mjs';
 import { report } from '../lib/report.mjs';
 import { controller, fixture, git, nativeWorktrunk } from './helpers.mjs';
@@ -22,9 +23,13 @@ import { controller, fixture, git, nativeWorktrunk } from './helpers.mjs';
 const host = nativeWorktrunk('wt-controller-host');
 const binary = process.platform === 'win32' ? nativeWorktrunk() : null;
 
-test('worktree cleanup intent owns the checkout and repository', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {
+test('worktree cleanup intent owns the checkout and repository through move recovery', { skip: process.platform !== 'win32', timeout: 120000 }, async t => {
   const s = controller(t, binary);
   git(s.root, 'config', 'worktrunk.default-branch', 'main');
+  const tracked = 'tracked-sentinel.txt';
+  fs.writeFileSync(path.join(s.root, tracked), 'committed checkout data');
+  git(s.root, 'add', '--', tracked);
+  git(s.root, 'commit', '-m', 'Add the tracked fixture');
   const raw = JSON.parse(fs.readFileSync(s.filename, 'utf8'));
   raw.policy.allowApply = true;
   raw.nativeHost = { path: host, version: 1, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex') };
@@ -114,7 +119,7 @@ test('worktree cleanup intent owns the checkout and repository', { skip: process
     } finally { restarted.close(); }
     assert.equal(git(selected.path, 'rev-parse', 'HEAD'), selected.head);
     assert.equal(git(other.path, 'rev-parse', 'HEAD'), other.head);
-    const writer = reserve(store, { roots: [other.path], owner: config.host.id, sessionId: 'before-intent' });
+    const writer = reserve(store, { roots: [s.root], owner: config.host.id, sessionId: 'before-intent' });
     assert.throws(() => beginWorktreeAction(config, store, selected.id), /owner\/cleanup claim/);
     const job = { kind: 'windows_job', launchToken: writer.token, helperPid: 1, activeProcesses: null };
     transition(store, writer.token, 'reserved', 'starting');
@@ -127,6 +132,39 @@ test('worktree cleanup intent owns the checkout and repository', { skip: process
     });
     assert.throws(() => store.transaction(tx => verifyWorktreeAction(config, tx, retry.id, late)), /Unstarted worktree intent required/);
     assert.equal(store.get('claim', retry.claimToken).value.state, 'released');
+
+    const bytes = fs.readFileSync(path.join(other.path, tracked));
+    store.db.exec("CREATE TRIGGER fail_move BEFORE INSERT ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='moved' BEGIN SELECT RAISE(ABORT,'injected move completion failure'); END;");
+    await assert.rejects(moveWorktreeToQuarantine(config, store, other.id, read), /move completion failure/);
+    store.db.exec('DROP TRIGGER fail_move');
+    const pending = store.list('action').find(({ value }) => value.phase === 'moving').value;
+    assert.equal(readCommandCompletion(config, pending.command.launch).exitCode, 0);
+    assert.equal(store.get('identity', pending.worktreeId).value.path, pending.originalPath);
+    assert.equal(store.get('claim', pending.claimToken).value.state, 'held');
+    assert.equal(fs.existsSync(pending.originalPath), false);
+    assert.deepEqual(fs.readFileSync(path.join(pending.payloadPath, tracked)), bytes);
+
+    const registration = path.join(pending.command.gitDir, 'gitdir');
+    const savedRegistration = fs.readFileSync(registration);
+    try {
+      fs.writeFileSync(registration, `${path.join(pending.originalPath, '.git')}\n`);
+      assert.throws(() => reconcile(config, store, pending.id), /registered worktree root/);
+      assert.equal(store.get('identity', pending.worktreeId).value.path, pending.originalPath);
+      assert.equal(store.get('claim', pending.claimToken).value.state, 'held');
+    } finally { fs.writeFileSync(registration, savedRegistration); }
+
+    const recovering = new Store(config.stateDir);
+    try {
+      const moved = reconcile(config, recovering, pending.id);
+      assert.equal(moved.phase, 'moved');
+      assert.equal(moved.moveExitCode, 0);
+      assert.equal(recovering.get('identity', moved.worktreeId).value.path, moved.payloadPath);
+      assert.equal(recovering.get('claim', moved.claimToken).value.roots[0].currentPath, moved.payloadPath);
+      assert.equal(reconcile(config, recovering, moved.id).phase, 'moved');
+      assert.equal(git(moved.payloadPath, 'rev-parse', 'HEAD'), other.head);
+      assert.equal(git(selected.path, 'rev-parse', 'HEAD'), selected.head);
+      assert.throws(() => reserve(recovering, { roots: [s.root], owner: config.host.id, sessionId: 'after-move' }), /Cleanup claim/);
+    } finally { recovering.close(); }
   } finally { store.close(); }
 });
 
@@ -134,7 +172,7 @@ function setup(t) {
   let store;
   const root = fixture(t, () => store?.close()), state = path.join(root, 'state');
   store = new Store(state);
-  const config = { nativeHost: { path: host, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex'), version: 1 }, host: { id: 'test-host' }, limits: { timeoutMs: 5000 } };
+  const config = { stateDir: state, nativeHost: { path: host, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex'), version: 1 }, host: { id: 'test-host' }, limits: { timeoutMs: 5000 } };
   return { root, state, store, config };
 }
 async function until(predicate) {
@@ -153,6 +191,68 @@ test('native host refuses unsupported lifetime containment without starting an a
   const s = setup(t), sentinel = path.join(s.root, 'never');
   const result = spawnSync(host, [], { input: JSON.stringify({ version: 1, token: 'a'.repeat(36), cwd: s.root, program: process.execPath, args: ['-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)},'bad')`] }) + '\n', encoding: 'utf8' });
   assert.equal(result.status, 1); assert.match(result.stderr, /not qualified/); assert.equal(fs.existsSync(sentinel), false);
+});
+
+test('journaled native command waits for durable authorization', { skip: process.platform !== 'win32' }, async t => {
+  const s = setup(t), sentinel = path.join(s.root, 'never');
+  const request = { root: s.root, program: process.execPath, args: ['-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)}, 'bad');`] };
+  s.store.db.exec("CREATE TRIGGER fail_command BEFORE INSERT ON records WHEN NEW.kind='action_command' BEGIN SELECT RAISE(ABORT,'injected authorization failure'); END;");
+  await assert.rejects(runJournaledCommand(s.config, s.store, request, (tx, launch) =>
+    tx.put('action_command', 'fixture', { version: 1, launch })), /authorization failure/);
+  assert.equal(fs.existsSync(sentinel), false);
+  assert.equal(s.store.get('action_command', 'fixture'), null);
+  assert.equal(fs.readdirSync(s.state).some(name => name.endsWith('.native-completion')), false);
+});
+
+test('journaled native completion survives controller death and proves descendant exit', { skip: process.platform !== 'win32' }, async t => {
+  const s = setup(t), ready = path.join(s.root, 'ready'), gate = path.join(s.root, 'gate');
+  const descendant = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)}, 'ready');const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)}))clearInterval(timer);},20);`;
+  const program = `const c=require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{detached:true,stdio:'ignore'});c.unref();process.exitCode=23;`;
+  const request = { root: s.root, program: process.execPath, args: ['-e', program] };
+  const worker = fileURLToPath(new URL('./fixtures/managed-worker.mjs', import.meta.url));
+  const parent = spawn(process.execPath, [worker, s.state, JSON.stringify(s.config), JSON.stringify(request), 'journaled'], { stdio: 'ignore', windowsHide: true });
+  const exited = once(parent, 'exit');
+  let launch;
+  try {
+    await until(() => fs.existsSync(ready));
+    assert.ok(parent.kill());
+    await exited;
+    const restarted = new Store(s.state);
+    try { launch = restarted.get('action_command', 'fixture').value.launch; }
+    finally { restarted.close(); }
+    assert.equal(readCommandCompletion(s.config, launch), null);
+    fs.writeFileSync(gate, 'finish');
+    let receipt;
+    await until(() => (receipt = readCommandCompletion(s.config, launch)) !== null);
+    assert.equal(receipt.evidence.activeProcesses, 1);
+    assert.equal(receipt.exitCode, 23);
+    assert.throws(() => readCommandCompletion(s.config, { ...launch, evidence: { ...launch.evidence, helperPid: launch.evidence.helperPid + 1 } }), /does not match authorization/);
+    assert.throws(() => readCommandCompletion(s.config, { ...launch, stateIdentity: {} }), /state boundary changed/);
+  } finally {
+    if (!fs.existsSync(gate)) fs.writeFileSync(gate, 'finish');
+    if (parent.exitCode === null && parent.signalCode === null) parent.kill();
+    await exited;
+    if (launch) await until(() => readCommandCompletion(s.config, launch) !== null);
+  }
+});
+
+test('journaled native command can finish after the controller wait times out', { skip: process.platform !== 'win32', timeout: 15000 }, async t => {
+  const s = setup(t), ready = path.join(s.root, 'ready'), gate = path.join(s.root, 'gate');
+  s.config.limits.timeoutMs = 2500;
+  const code = `const fs=require('fs');fs.writeFileSync(${JSON.stringify(ready)}, 'ready');const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)}))clearInterval(timer);},20);`;
+  const open = () => fs.writeFileSync(gate, 'finish');
+  t.signal.addEventListener('abort', open, { once: true });
+  try {
+    await assert.rejects(runJournaledCommand(s.config, s.store, { root: s.root, program: process.execPath, args: ['-e', code] },
+      (tx, launch) => tx.put('action_command', 'fixture', { version: 1, launch })), /completion unavailable/);
+    const { launch } = s.store.get('action_command', 'fixture').value;
+    assert.equal(fs.existsSync(ready), true);
+    assert.equal(readCommandCompletion(s.config, launch), null);
+    open();
+    let receipt;
+    await until(() => (receipt = readCommandCompletion(s.config, launch)) !== null);
+    assert.equal(receipt.exitCode, 0);
+  } finally { t.signal.removeEventListener('abort', open); open(); }
 });
 
 test('native job retains detached and OS-suspended descendants until completion', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {

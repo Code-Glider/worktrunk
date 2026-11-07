@@ -9,6 +9,10 @@ function roots(paths) {
   return result;
 }
 
+export function holdsWorktreeRepository(action) {
+  return action.kind === 'worktree' && ['intent', 'prepared', 'moving', 'moved'].includes(action.phase);
+}
+
 function fences(tx, claim, root) {
   const result = [root.path];
   if (claim.actionId) {
@@ -17,13 +21,13 @@ function fences(tx, claim, root) {
     if (digest(fileIdentity(path.dirname(root.path))) !== digest(action.originalParent)) throw new Error('Cleanup parent changed');
     const containerPath = localPath(action.containerPath, { missing: true });
     result.push(containerPath);
-    if (action.kind === 'worktree' && action.phase === 'intent') {
+    if (holdsWorktreeRepository(action)) {
       for (const checkoutPath of action.repositoryPaths) result.push(localPath(checkoutPath, { missing: true }));
     }
     if (action.containerIdentity) {
       if (digest(fileIdentity(containerPath)) !== digest(action.containerIdentity)) throw new Error('Cleanup container changed');
     } else if (fs.existsSync(containerPath)) throw new Error('Cleanup container is unverified');
-    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['quarantined', 'restoring', 'purging'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
+    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['moved', 'quarantined', 'restoring', 'purging'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
   } else if (root.currentPath) throw new Error('Cleanup relocation has no action');
   if (digest(fileIdentity(root.currentPath ?? root.path)) !== digest(root.incarnation)) throw new Error('Claim incarnation changed');
   return result;

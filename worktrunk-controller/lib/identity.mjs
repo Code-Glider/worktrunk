@@ -54,9 +54,13 @@ export function enroll(store, root, gitDir, kind = 'worktree', now = Date.now())
 }
 
 export function recordRelocation(store, id, newRoot, newGitDir) {
-  const old = store.get('identity', id);
-  if (!old) throw new Error('Unknown identity');
-  const marker = path.join(localPath(newGitDir), `worktrunk-controller-${old.value.kind}.json`);
-  if (digest(old.value.evidence) !== digest(evidence(newRoot, newGitDir, marker))) throw new Error('Relocation changed incarnation');
-  store.transaction(tx => tx.put('identity', id, { ...old.value, path: localPath(newRoot), gitDir: localPath(newGitDir) }));
+  const relocate = tx => {
+    const old = tx.get('identity', id);
+    if (!old) throw new Error('Unknown identity');
+    const marker = path.join(localPath(newGitDir), `worktrunk-controller-${old.value.kind}.json`);
+    if (digest(old.value.evidence) !== digest(evidence(newRoot, newGitDir, marker))) throw new Error('Relocation changed incarnation');
+    tx.put('identity', id, { ...old.value, path: localPath(newRoot), gitDir: localPath(newGitDir) });
+  };
+  if (store.writing) relocate(store);
+  else store.transaction(relocate);
 }
