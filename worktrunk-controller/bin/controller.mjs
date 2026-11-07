@@ -8,7 +8,7 @@ import { invocation } from '../lib/invoke.mjs';
 import { enroll } from '../lib/identity.mjs';
 import { scanProject } from '../lib/observe.mjs';
 import { localPath } from '../lib/paths.mjs';
-import { ingest, syncGitHubIssue } from '../lib/events.mjs';
+import { ingest, syncGitHubIssue, syncKnownGitHubIssues } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
 import { managedCheckout, runManaged } from '../lib/managed.mjs';
 import { enrollArtifact, inspectArtifact } from '../lib/artifacts.mjs';
@@ -37,8 +37,8 @@ const positiveNumber = value => /^[1-9]\d*$/.test(value ?? '') && Number.isSafeI
 try {
   const { values, positionals } = parseArgs({ options: { config: { type: 'string' }, project: { type: 'string' }, artifact: { type: 'string' }, decision: { type: 'string' }, action: { type: 'string' }, path: { type: 'string' }, source: { type: 'string' }, issue: { type: 'string' }, attempt: { type: 'string' }, agent: { type: 'string' }, session: { type: 'string' }, program: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, format: { type: 'string', default: 'text' } }, allowPositionals: true });
   const [command, ...extra] = positionals;
-  const allowed = { scan: ['project', 'action'], enroll: ['project', 'path'], 'enroll-artifact': ['artifact'], ingest: ['source'], 'sync-github-issue': ['source', 'issue'], report: ['project', 'from', 'to'], run: ['project', 'path', 'session', 'program', 'source', 'issue', 'attempt', 'agent'], apply: ['decision'], purge: ['decision'], restore: ['action'], reconcile: ['action'] };
-  if ((extra.length && command !== 'run') || !Object.hasOwn(allowed, command) || !values.config || !['json', 'text'].includes(values.format)) throw new Error('Usage: node worktrunk-controller/bin/controller.mjs scan|enroll|enroll-artifact|ingest|sync-github-issue|report|run|apply|purge|restore|reconcile --config <absolute-file> [--project <id>] [--artifact <id>] [--decision <id>] [--action <id>] [--path <absolute-worktree>] [--source <id>] [--issue <number>] [--attempt <number>] [--agent <id>] [--from YYYY-MM-DD --to YYYY-MM-DD] [--format json|text] [--session <id> --program <absolute-executable> -- <args>...]');
+  const allowed = { scan: ['project', 'action'], enroll: ['project', 'path'], 'enroll-artifact': ['artifact'], ingest: ['source'], 'sync-github-issue': ['source', 'issue'], 'sync-github-issues': [], report: ['project', 'from', 'to'], run: ['project', 'path', 'session', 'program', 'source', 'issue', 'attempt', 'agent'], apply: ['decision'], purge: ['decision'], restore: ['action'], reconcile: ['action'] };
+  if ((extra.length && command !== 'run') || !Object.hasOwn(allowed, command) || !values.config || !['json', 'text'].includes(values.format)) throw new Error('Usage: node worktrunk-controller/bin/controller.mjs scan|enroll|enroll-artifact|ingest|sync-github-issue|sync-github-issues|report|run|apply|purge|restore|reconcile --config <absolute-file> [--project <id>] [--artifact <id>] [--decision <id>] [--action <id>] [--path <absolute-worktree>] [--source <id>] [--issue <number>] [--attempt <number>] [--agent <id>] [--from YYYY-MM-DD --to YYYY-MM-DD] [--format json|text] [--session <id> --program <absolute-executable> -- <args>...]');
   if (Object.keys(values).some(key => !['config', 'format', ...allowed[command]].includes(key))) throw new Error('Option is not supported for this command');
   if (['enroll', 'run'].includes(command) !== Boolean(values.path) || (['enroll', 'run'].includes(command) && !values.project)) throw new Error('Enrollment/managed run require --project and --path');
   if (command === 'run' && (!values.session || !values.program)) throw new Error('Managed run requires --session and --program');
@@ -62,6 +62,10 @@ try {
     const actionKind = values.action && store.get('action', values.action)?.value.kind;
     if (command === 'ingest') output = ingest(config, store, values.source, readEvent());
     else if (command === 'sync-github-issue') output = await syncGitHubIssue(config, store, values.source, Number(values.issue));
+    else if (command === 'sync-github-issues') {
+      output = await syncKnownGitHubIssues(config, store);
+      if (output.failed.length) process.exitCode = 1;
+    }
     else if (command === 'apply' && decisionKind === 'worktree') {
       const moved = await moveWorktreeToQuarantine(config, store, values.decision);
       output = await lockWorktreeQuarantine(config, store, moved.id);
@@ -123,6 +127,10 @@ try {
     else if (command === 'enroll' || command === 'enroll-artifact') process.stdout.write(`Enrolled ${output.path} (${output.id})\n`);
     else if (command === 'ingest') process.stdout.write(`${output.replay ? 'Already recorded' : 'Recorded'} event ${output.id}\n`);
     else if (command === 'sync-github-issue') process.stdout.write(`GitHub issue #${output.issue} from ${output.source}. Recorded ${output.recorded} events and replayed ${output.replayed}.\n`);
+    else if (command === 'sync-github-issues') {
+      process.stdout.write(`Refreshed ${output.synced.length} tracked GitHub issues. ${output.failed.length} failed.\n`);
+      for (const failure of output.failed) process.stderr.write(`GitHub issue #${failure.issue} from ${failure.source}. ${failure.error}\n`);
+    }
     else if (command === 'run') process.stdout.write(`Managed launch ${output.token} ended; exit ${output.exitCode ?? 'unavailable'}\n`);
     else if (['apply', 'purge', 'restore', 'reconcile'].includes(command)) process.stdout.write(`Action ${output.id}: ${output.phase}${output.purgeOutcome === 'interrupted' ? '; purge interrupted, only remaining contents can be restored' : ''}\n`);
     else if (command === 'report') {

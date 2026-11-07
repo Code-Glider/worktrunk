@@ -149,18 +149,24 @@ test('disposable runner and CLI preserve work until a newly reviewed GitHub acce
   const timestamp = at => new Date(at).toISOString().replace('.000Z', 'Z');
   const accepted = { event: 'commented', id: 87, user: { type: 'User', id: 5 }, created_at: timestamp(acceptedAt),
     updated_at: timestamp(acceptedAt), body: `/worktrunk accept 1 ${head}` };
-  const sync = () => run(['sync-github-issue', '--source', 'issues', '--issue', '7']);
   timeline([accepted]);
-  assert.equal(sync().recorded, 1);
+  assert.equal(store.list('event').length, 0);
 
   const runner = fileURLToPath(new URL('../scheduling/scan-report.ps1', import.meta.url));
   let selected;
   for (let cycle = 0; cycle < 2; cycle++) {
+    if (cycle === 1) timeline(null);
     const result = spawnSync(process.env.PWSH_PATH ?? 'pwsh', ['-NoProfile', '-NonInteractive', '-File', runner,
-      '-Node', process.execPath, '-Config', s.filename, '-TimeoutSeconds', '35'], { env, encoding: 'utf8', windowsHide: true, timeout: 42000 });
-    assert.equal(result.status, 0, result.stderr || result.error?.message);
+      '-Node', process.execPath, '-Config', s.filename, '-TimeoutSeconds', '35', '-SyncGitHubIssues'], { env, encoding: 'utf8', windowsHide: true, timeout: 42000 });
+    assert.equal(result.status, cycle, result.stderr || result.error?.message);
+    if (cycle === 0) assert.match(result.stdout, /Refreshed 1 tracked GitHub issues\. 0 failed\./);
+    else {
+      assert.match(result.stderr, /GitHub issue #7 from issues\. Invalid GitHub issue timeline/);
+      assert.match(result.stderr, /GitHub issue refresh failed with exit 1/);
+    }
     assert.match(result.stdout, /worktree apply enabled/);
     assert.match(result.stdout, /Observed first accepted tasks:/);
+    assert.deepEqual(store.list('event').map(row => row.value.event.type), ['attempt_accepted']);
     const current = store.get('scan', 'myproject').value.decisions.find(decision => decision.branch === branch);
     assert.equal(current.status, 'eligible', JSON.stringify(current));
     if (selected) assert.equal(current.id, selected.id);
@@ -170,6 +176,7 @@ test('disposable runner and CLI preserve work until a newly reviewed GitHub acce
     assert.equal(fs.readFileSync(path.join(checkout, tracked), 'utf8'), 'committed checkout data');
   }
 
+  timeline([accepted]);
   const action = run(['apply', '--decision', selected.id]);
   assert.equal(action.phase, 'quarantined');
   await until(() => retentionStatus(action.retentionClock, sampleClock(), config.policy.retentionMs) === null);
@@ -207,7 +214,9 @@ test('disposable runner and CLI preserve work until a newly reviewed GitHub acce
   const approvedAt = reopenedAt + 1000;
   await until(() => Date.now() >= approvedAt);
   timeline([accepted, reopened, { ...accepted, id: 88, created_at: timestamp(approvedAt), updated_at: timestamp(approvedAt) }]);
-  assert.equal(sync().recorded, 1);
+  const refreshed = run(['sync-github-issues']);
+  assert.deepEqual(refreshed.failed, []);
+  assert.deepEqual(refreshed.synced.map(row => [row.issue, row.recorded, row.replayed]), [[7, 1, 2]]);
   const approved = review();
   assert.equal(approved.status, 'eligible', JSON.stringify(approved));
   assert.notEqual(approved.id, first.id);

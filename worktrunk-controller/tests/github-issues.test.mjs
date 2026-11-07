@@ -5,7 +5,7 @@ import path from 'node:path';
 import { digest } from '../lib/data.mjs';
 import { checkoutProducerFence, reserve } from '../lib/admission.mjs';
 import { loadConfig } from '../lib/config.mjs';
-import { ingest, syncGitHubIssue } from '../lib/events.mjs';
+import { ingest, syncGitHubIssue, syncKnownGitHubIssues } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
 import { Store } from '../lib/store.mjs';
 import { fileIdentity } from '../lib/paths.mjs';
@@ -106,6 +106,48 @@ test('a late response cannot overwrite a concurrently committed issue snapshot',
   await pending;
   assert.equal(read().tasks[0].currentOutcome, 'reopened');
   assert.equal(store.list('event').length, 1);
+});
+
+test('refreshes saved issues and legacy launch bindings without losing evidence on a failed read', async t => {
+  const { config, store, sync, read } = setup(t);
+  await sync([[comment]]);
+  const issueKey = digest([source.instance, 7]);
+  const previous = store.get('github_issue', issueKey);
+  store.transaction(tx => {
+    for (const [issue, sourceInstance] of [[8, source.instance], [9, 'removed-source']]) {
+      tx.put('claim', String(issue), { version: 1, kind: 'producer', task: { issue, sourceInstance } });
+    }
+    tx.put('github_issue', digest([source.instance, 8]), { version: 1, sourceInstance: source.instance, taskKey: 'legacy-snapshot' });
+    tx.put('github_issue', digest([source.instance, 10]), { version: 1, sourceInstance: source.instance, taskKey: 'legacy-without-launch' });
+  });
+  const reads = [];
+  let failedRead = true;
+  const get = async endpoint => {
+    if (endpoint === repoPath) return repo;
+    if (endpoint === issuePath) { reads.push(7); return issue; }
+    if (endpoint === `${repoPath}/issues/8`) { reads.push(8); return { ...issue, id: 39, number: 8 }; }
+    if (endpoint === timelinePath) {
+      if (failedRead) throw new Error('Read unavailable');
+      return [[comment, reopened]];
+    }
+    assert.equal(endpoint, `${repoPath}/issues/8/timeline?per_page=100`);
+    return [[{ ...comment, id: 45 }]];
+  };
+  const partial = await syncKnownGitHubIssues(config, store, get);
+  assert.deepEqual(reads, [7, 8]);
+  assert.deepEqual(partial.failed, [{ source: 'github', issue: 7, error: 'Read unavailable' }]);
+  assert.deepEqual(partial.synced.map(row => [row.issue, row.recorded]), [[8, 1]]);
+  assert.deepEqual(store.get('github_issue', issueKey), previous);
+
+  failedRead = false;
+  reads.length = 0;
+  const complete = await syncKnownGitHubIssues(config, store, get);
+  assert.deepEqual(reads, [7, 8]);
+  assert.deepEqual(complete.failed, []);
+  assert.deepEqual(complete.synced.map(row => [row.issue, row.recorded, row.replayed]), [[7, 1, 1], [8, 0, 1]]);
+  assert.equal(read().tasks.find(task => task.taskId === '38').currentOutcome, 'reopened');
+  assert.equal(read().observedFirstAcceptedTasks, 2);
+  assert.equal(read().observedReopens, 1);
 });
 
 test('throughput uses only matching ended launches and keeps GitHub authoritative', async t => {

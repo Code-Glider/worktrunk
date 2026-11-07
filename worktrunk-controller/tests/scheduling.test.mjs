@@ -35,7 +35,7 @@ test('Windows scheduler example parses with disabled least-privilege observation
   assert.equal(value.principal.RunLevel, 'LeastPrivilege'); assert.equal(value.principal.LogonType, 'InteractiveToken');
   assert.equal(value.interval, '1'); assert.equal(value.start, '2026-01-01T03:00:00');
   assert.match(value.action.Command, /pwsh\.exe$/); assert.match(value.action.Arguments, /scan-report\.ps1/);
-  assert.match(value.action.Arguments, /-TimeoutSeconds 900/); assert.doesNotMatch(value.action.Arguments, /\b(apply|purge|enroll|reconcile|Bypass)\b/);
+  assert.match(value.action.Arguments, /-TimeoutSeconds 900/); assert.doesNotMatch(value.action.Arguments, /\b(apply|purge|enroll|reconcile|Bypass|SyncGitHubIssues)\b/);
 });
 
 function launch(script, config, timeout = 20, node = process.execPath) {

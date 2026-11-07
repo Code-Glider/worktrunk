@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)][string]$Node,
     [Parameter(Mandatory)][string]$Config,
-    [ValidateRange(1, 86400)][int]$TimeoutSeconds = 900
+    [ValidateRange(1, 86400)][int]$TimeoutSeconds = 900,
+    [switch]$SyncGitHubIssues
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,7 +25,7 @@ try {
     $from = $to.AddDays(-7)
     $controller = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../bin/controller.mjs'))
 
-    function Invoke-Observation([string[]]$Arguments) {
+    function Invoke-Observation([string[]]$Arguments, [switch]$AllowFailure) {
         $remaining = [int][Math]::Floor($TimeoutSeconds * 1000 - $clock.Elapsed.TotalMilliseconds)
         if ($remaining -le 0) { throw 'Scan/report wait budget exhausted' }
         $info = [Diagnostics.ProcessStartInfo]::new($Node)
@@ -50,12 +51,18 @@ try {
             }
             $remaining = [int][Math]::Max(0, [Math]::Floor($TimeoutSeconds * 1000 - $clock.Elapsed.TotalMilliseconds))
             if (-not [Threading.Tasks.Task]::WaitAll($drains, $remaining)) { throw 'Scan/report wait budget exhausted while forwarding output' }
+            if ($AllowFailure) { return $process_.ExitCode }
             if ($process_.ExitCode -ne 0) { throw "Observation command failed with exit $($process_.ExitCode)" }
         } finally { $process_.Dispose() }
     }
 
+    $syncExit = 0
+    if ($SyncGitHubIssues) {
+        $syncExit = Invoke-Observation -Arguments @('sync-github-issues', '--config', $Config) -AllowFailure
+    }
     Invoke-Observation -Arguments @('scan', '--config', $Config)
     Invoke-Observation -Arguments @('report', '--config', $Config, '--from', $from.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture), '--to', $to.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))
+    if ($syncExit -ne 0) { throw "GitHub issue refresh failed with exit $syncExit" }
 } catch {
     [Console]::Error.WriteLine($_.Exception.Message)
     exit 1

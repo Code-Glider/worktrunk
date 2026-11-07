@@ -18,6 +18,26 @@ export async function syncGitHubIssue(config, store, sourceId, issueNumber, requ
   return (await syncGitHubIssueSnapshot(config, store, sourceId, issueNumber, request)).result;
 }
 
+export async function syncKnownGitHubIssues(config, store, request = githubGet) {
+  const sources = new Map(config.eventSources.filter(source => source.github)
+    .map(source => [source.instance, { id: source.id, issues: new Set() }]));
+  const addIssue = (instance, issue) => {
+    if (Number.isSafeInteger(issue) && issue > 0) sources.get(instance)?.issues.add(issue);
+  };
+  for (const { value } of store.list('github_issue')) addIssue(value.sourceInstance, value.issue);
+  for (const { value } of store.list('claim')) {
+    if (value.kind === 'producer' && value.task) addIssue(value.task.sourceInstance, value.task.issue);
+  }
+  const synced = [], failed = [];
+  for (const { id, issues } of sources.values()) {
+    for (const issue of [...issues].sort((a, b) => a - b)) {
+      try { synced.push(await syncGitHubIssue(config, store, id, issue, request)); }
+      catch (error) { failed.push({ source: id, issue, error: error.message }); }
+    }
+  }
+  return { version: 1, synced, failed };
+}
+
 export async function syncGitHubIssueSnapshot(config, store, sourceId, issueNumber, request = githubGet) {
   const source = config.eventSources.find(source => source.id === sourceId);
   if (!source?.github) throw new Error('Select a configured GitHub issue source');
@@ -35,7 +55,7 @@ export async function syncGitHubIssueSnapshot(config, store, sourceId, issueNumb
     if (tx.get('github_issue', key)?.revision !== revision) throw new Error('A concurrent GitHub issue sync superseded this read');
     const results = events.map(event => recordEvent(tx, source, event, observedAt));
     if (!binding && !events.length) tx.put('event_source', source.instance, { version: 1, source });
-    const issueRevision = tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, taskKey, readStartedAt, observedAt, acceptances });
+    const issueRevision = tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, issue: issueNumber, taskKey, readStartedAt, observedAt, acceptances });
     return { issueRevision, result: { version: 1, source: source.id, issue: issueNumber, taskId, recorded: results.filter(result => !result.replay).length, replayed: results.filter(result => result.replay).length } };
   });
 }

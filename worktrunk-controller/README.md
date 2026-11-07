@@ -33,13 +33,15 @@ node worktrunk-controller/bin/controller.mjs enroll --config <absolute-config.js
 
 Each inventory item has a decision ID, status and reasons. Logical bytes describe checkout content. Physical savings remain unavailable. Ignored or untracked files, hidden index entries, links, nested repositories, user locks, primary or default checkouts, unknown age and protected paths veto eligibility. Assume-unchanged and skip-worktree flags make cleanliness unknown. A failed probe produces `analysis_failed`, keeps the data and makes the CLI exit nonzero.
 
-An enrolled checkout can qualify in a scan when its exact completed attempt and current commit match a recent explicit GitHub acceptance. Run `sync-github-issue` after the managed launch ends and the reviewer accepts its commit. Scans use the last successful read and retain the checkout when that read began more than five minutes ago. Reopening, a higher numbered attempt, or a later producer on the checkout can invalidate the evidence. JSON includes the issue observation time and the task and producer reasons.
+An enrolled checkout can qualify in a scan when its exact completed attempt and current commit match a recent explicit GitHub acceptance. Refresh the issue after the managed launch ends and the reviewer accepts its commit. Scans use the last successful read and retain the checkout when that read began more than five minutes ago. Reopening, a higher numbered attempt, or a later producer on the checkout can invalidate the evidence. JSON includes the issue observation time and the task and producer reasons.
 
 For checkout eligibility, the registry project must declare `"producerAdmission":"cooperative-windows-job-v1"` before launch. This asserts that all checkout writers use the native admission contract. The scan verifies the same pinned helper used by the completed launch and checks for active or unresolved claims. Older launches without recorded checkout claim history remain available for throughput. `worktreeApplyEnabled` means at least one selected project has the Windows helper, opt-in policy, producer declaration and GitHub issue binding configured. Eligibility remains a preview until the selected executor verifies current evidence.
 
 ## Scan/report job example
 
-[scheduling/scan-report.ps1](scheduling/scan-report.ps1) runs only `scan`, then `report` for `[today UTC − 7 days, today UTC)`. It fixes the window once per invocation, stops on either command's failure and shares a default 900-second wait budget between the commands and output forwarding. It uses the existing configured registry and artifact allowlist. Scans retain their documented state/metadata writes; this job never invokes enrollment, cleanup or reconciliation.
+[scheduling/scan-report.ps1](scheduling/scan-report.ps1) runs `scan`, then `report` for `[today UTC − 7 days, today UTC)` by default. It fixes the window once per invocation, stops on either command's failure and shares a default 900-second wait budget between the commands and output forwarding. It uses the configured registry and artifact allowlist. The job writes scan state and metadata and performs no cleanup.
+
+Add `-SyncGitHubIssues` to refresh tracked issues before scanning. The runner uses GitHub CLI access under the scheduled account and shares its wait budget with the refresh. If the refresh exits unsuccessfully, the runner still scans and reports, then exits nonzero. A launch failure or timeout stops the cycle. The disabled XML example leaves GitHub refresh off.
 
 Use native Windows, PowerShell 7 and Node 24.15.x. Supply absolute Node/config paths and keep the private configuration outside managed roots. The configuration directory must be writable: a persistent, empty `controller.json.scan-report.lock` beside it holds an exclusive handle while participating runners use that same path. Leave the file present. Separate config aliases, direct CLI calls and orphan observers after abrupt runner termination are outside this cooperative lock.
 
@@ -184,9 +186,12 @@ A configured reviewer posts one line on the issue in the form `/worktrunk accept
 
 ```console
 node worktrunk-controller/bin/controller.mjs sync-github-issue --config <absolute-config.json> --source github --issue 123 --format json
+node worktrunk-controller/bin/controller.mjs sync-github-issues --config <absolute-config.json> --format json
 ```
 
 Sync reads the selected issue through the authenticated GitHub CLI and stores normalized observations locally. The report shows the time of the last successful read. If a previously observed acceptance comment is edited or deleted, the next sync excludes it from current status and preserves the historical observation.
+
+The plural command refreshes issues already tracked by managed launches or saved issue numbers for configured sources. To include an issue synced by an older controller without a managed launch, sync it once by number. Each issue commits independently. Failed reads leave their last successful evidence intact, appear in the command result and cause a nonzero exit.
 
 To associate a managed launch with an issue, add `--source github --issue 123 --attempt 1` before the program argument separator. Optionally add `--agent <agent-id>` for throughput attribution. The launcher reads the issue and verifies the enrolled checkout before admitting the job. Each launch for the issue requires a higher attempt number, including after an interrupted launch. When the native job proves its processes have exited, the controller records the checkout's final commit.
 
