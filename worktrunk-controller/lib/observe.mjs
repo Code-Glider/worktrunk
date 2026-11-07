@@ -13,7 +13,10 @@ import { worktreeProducerEvidence, worktreeTaskEvidence } from './worktree-evide
 const integrationReasons = new Set(['same_commit', 'ancestor', 'trees_match', 'no_added_changes', 'merge_adds_nothing', 'patch_id_match']);
 const codeRoot = fileURLToPath(new URL('../', import.meta.url));
 
-export function inventoryContents(root, limits, { skipGit = true, visitEntry = () => {} } = {}) {
+export function inventoryContents(root, limits, { skipGit = true, visitEntry = () => {}, measureCheckout = false } = {}) {
+  const canonical = localPath(root);
+  const device = measureCheckout ? fs.lstatSync(canonical, { bigint: true }).dev : 0n;
+  let allocationKnown = device !== 0n, allocated = 0n, rebuildFiles = 0;
   let files = 0, bytes = 0, nested = false, links = false;
   const entries = [];
   function visit(directory, relative = '') {
@@ -23,11 +26,17 @@ export function inventoryContents(root, limits, { skipGit = true, visitEntry = (
       if (skipGit && !relative && name === '.git') continue;
       if (++files > limits.maxFiles) throw new Error('Content inventory exceeds file limit');
       const stat = fs.lstatSync(child, { bigint: true });
+      if (allocationKnown && stat.dev !== device) allocationKnown = false;
       visitEntry(key, stat);
       if (name === '.git') nested = true;
       if (stat.isSymbolicLink()) { links = true; entries.push([key, 'link']); }
       else if (stat.isDirectory()) { entries.push([key, 'directory']); visit(child, key); }
       else if (stat.isFile()) {
+        if (measureCheckout) {
+          rebuildFiles++;
+          if (stat.nlink !== 1n || typeof stat.blocks !== 'bigint' || stat.blocks < 0n) allocationKnown = false;
+          if (allocationKnown) allocated += stat.blocks * 512n;
+        }
         const size = Number(stat.size);
         bytes += size;
         if (!Number.isSafeInteger(bytes) || bytes > limits.maxBytes) throw new Error('Content inventory exceeds byte limit');
@@ -52,8 +61,13 @@ export function inventoryContents(root, limits, { skipGit = true, visitEntry = (
       } else throw new Error('Unsupported content type');
     }
   }
-  visit(localPath(root));
-  return { logicalBytes: bytes, physicalSavings: null, files, nested, links, fingerprint: digest(entries) };
+  visit(canonical);
+  // shortcut: block counts cannot see shared extents, use filesystem-specific accounting if actual savings are needed.
+  const checkoutEstimate = measureCheckout ? {
+    estimatedReclaimableBytes: allocationKnown && !nested && !links && allocated <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(allocated) : null,
+    rebuildFiles,
+  } : undefined;
+  return { logicalBytes: bytes, physicalSavings: null, files, nested, links, fingerprint: digest(entries), ...(checkoutEstimate ? { checkoutEstimate } : {}) };
 }
 
 export function validateObservation(value) {
@@ -105,6 +119,7 @@ export function scanProject(config, store, project, now = Date.now(), action, qu
     } catch (error) { failure = error.message; }
     const selectedPath = quarantine ? action.payloadPath : action?.originalPath;
     const selectedInventory = selectedPath ? inventory.filter(entry => path.relative(entry.path, selectedPath) === '') : inventory;
+    const estimates = new Map();
     let decisions = selectedInventory.map(entry => {
       const target = { kind: 'worktree', project: project.id, path: entry.path, branch: entry.branch ?? null, head: entry.HEAD ?? null };
       let evidence;
@@ -125,7 +140,7 @@ export function scanProject(config, store, project, now = Date.now(), action, qu
         const gitDir = localPath(git(['rev-parse', '--absolute-git-dir'], root).trim());
         const identity = inspectIdentity(store, root, gitDir)?.value ?? null;
         const incarnation = fileIdentity(root);
-        const contents = inventoryContents(root, config.limits);
+        const { checkoutEstimate, ...contents } = inventoryContents(root, config.limits, { measureCheckout: !action });
         const status = git(['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignored=matching', '--ignore-submodules=none'], root);
         const records = status.split('\0');
         // Git status deliberately hides assume-unchanged and skip-worktree content.
@@ -158,13 +173,20 @@ export function scanProject(config, store, project, now = Date.now(), action, qu
           acceptedTask: gate?.task.status === 'accepted', inactiveProducers: gate?.producer.status === 'inactive',
           ...(gate ? { taskEvidence: gate.task, producerEvidence: gate.producer, repositoryIncarnation } : {}),
         };
-        return { ...target, ...decideWorktree(evidence, config.policy, now), evidence };
+        const decision = decideWorktree(evidence, config.policy, now);
+        if (decision.status === 'eligible' && checkoutEstimate) estimates.set(entry.path, checkoutEstimate);
+        return { ...target, ...decision, evidence };
       } catch (error) { return { ...target, status: 'analysis_failed', reasons: ['observation_unavailable'], error: error.message, evidence: null }; }
     });
     try {
       if (commonDir !== currentCommonDir() || digest(repositoryIncarnation) !== digest(fileIdentity(commonDir)) || digest(beforeRefs) !== digest(refVector(git)) ||
         digest(inventory) !== digest(worktreeInventory(git))) throw new Error('Repository inventory changed during content observation');
     } catch (error) { decisions = decisions.map(decision => ({ ...decision, status: 'analysis_failed', reasons: ['observation_unavailable'], error: error.message, evidence: null })); }
-    return { version: 1, project: project.id, observedAt: now, policyGeneration: config.generation, applyEnabled: false, decisions: decisions.map(decision => ({ ...decision, id: digest({ policy: config.generation, ...decision }) })) };
+    decisions = decisions.map(decision => ({ ...decision, id: digest({ policy: config.generation, ...decision }) }));
+    const scan = { version: 1, project: project.id, observedAt: now, policyGeneration: config.generation, applyEnabled: false, decisions };
+    if (!action) scan.eligibleCandidates = decisions.filter(decision => decision.status === 'eligible').map(({ id, path, evidence }) => ({
+      decisionId: id, path, logicalBytes: evidence.contents.logicalBytes, ...estimates.get(path),
+    }));
+    return scan;
   });
 }

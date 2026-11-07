@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Store } from '../lib/store.mjs';
 import { ingest } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
+import { inventoryContents } from '../lib/observe.mjs';
 import { controller, fixture } from './helpers.mjs';
 
 const sources = [
@@ -45,8 +47,21 @@ test('worktree backlog distinguishes an unavailable inventory from observed work
     { status: 'retain', reasons: ['stale_registration_report_only'] },
     { status: 'analysis_failed', reasons: ['observation_unavailable'] },
   ] });
-  assert.deepEqual(JSON.parse(invoke('json')).backlog, [{ project: 'myproject', observedAt: base, policyCurrent: true, status: 'observed', worktrees: 3, eligible: 1, retained: 1, analysisFailed: 1, staleRegistrations: 1, reasons: ['stale_registration_report_only', 'observation_unavailable'] }]);
+  assert.deepEqual(JSON.parse(invoke('json')).backlog, [{ project: 'myproject', observedAt: base, policyCurrent: true, status: 'observed', worktrees: 3, eligible: 1, eligibleCandidates: null, retained: 1, analysisFailed: 1, staleRegistrations: 1, reasons: ['stale_registration_report_only', 'observation_unavailable'] }]);
   assert.match(invoke('text'), /Worktree backlog for myproject: 3 observed; 1 eligible; 1 retained; 1 analysis failed; 1 stale registration/);
+
+  const candidates = [
+    { decisionId: 'unknown', path: 'unknown', logicalBytes: 65536, estimatedReclaimableBytes: null, rebuildFiles: 1 },
+    { decisionId: 'more-files', path: 'more-files', logicalBytes: 10, estimatedReclaimableBytes: 4096, rebuildFiles: 2 },
+    { decisionId: 'fewer-files', path: 'fewer-files', logicalBytes: 12, estimatedReclaimableBytes: 4096, rebuildFiles: 1 },
+    { decisionId: 'most-bytes', path: 'most-bytes', logicalBytes: 24, estimatedReclaimableBytes: 8192, rebuildFiles: 3 },
+  ];
+  const decisions = candidates.map(candidate => ({ id: candidate.decisionId, status: 'eligible', reasons: [] }));
+  writeScan({ observedAt: base, policyGeneration: s.config.generation, decisions, eligibleCandidates: candidates });
+  assert.deepEqual(JSON.parse(invoke('json')).backlog[0].eligibleCandidates, [candidates[3], candidates[2], candidates[1], candidates[0]]);
+  assert.match(invoke('text'), /most-bytes.*24 logical bytes.*8192 estimated reclaimable bytes.*3 files[\s\S]*unknown.*allocation unavailable/);
+  writeScan({ observedAt: base, policyGeneration: 'old', decisions, eligibleCandidates: candidates });
+  assert.equal(JSON.parse(invoke('json')).backlog[0].eligibleCandidates, null);
 
   writeScan({ status: 'analysis_failed', error: 'Git inventory unavailable', decisions: [] });
   const [failed] = JSON.parse(invoke('json')).backlog;
@@ -54,6 +69,24 @@ test('worktree backlog distinguishes an unavailable inventory from observed work
   assert.equal(failed.error, 'Git inventory unavailable');
   for (const field of ['worktrees', 'eligible', 'retained', 'analysisFailed', 'staleRegistrations']) assert.equal(failed[field], null);
   assert.match(invoke('text'), /Worktree backlog for myproject: unavailable \(Git inventory unavailable\)/);
+});
+
+test('checkout inventory estimates allocation without altering content evidence', t => {
+  const root = fixture(t);
+  const file = path.join(root, 'tracked');
+  fs.writeFileSync(file, Buffer.alloc(65536, 1));
+  fs.mkdirSync(path.join(root, 'empty'));
+  fs.mkdirSync(path.join(root, '.git'));
+  fs.writeFileSync(path.join(root, '.git', 'objects'), Buffer.alloc(65536, 2));
+  const limits = { maxFiles: 3, maxBytes: 131072 };
+  const read = () => inventoryContents(root, limits, { measureCheckout: true });
+  const { checkoutEstimate, ...contents } = read();
+  assert.equal(contents.logicalBytes, 65536);
+  assert.deepEqual(contents, inventoryContents(root, limits));
+  const stat = fs.statSync(file, { bigint: true });
+  assert.deepEqual(checkoutEstimate, { estimatedReclaimableBytes: stat.dev && stat.blocks >= 0n ? Number(stat.blocks * 512n) : null, rebuildFiles: 1 });
+  fs.linkSync(file, path.join(root, 'hardlink'));
+  assert.deepEqual(read().checkoutEstimate, { estimatedReclaimableBytes: null, rebuildFiles: 2 });
 });
 
 test('weekly distinct tasks, first-attempt cancellations, retries and accepted cohort durations are exact after replay', t => {

@@ -141,6 +141,11 @@ try {
         const summary = project.status === 'analysis_failed' ? `unavailable (${project.error})`
           : `${project.worktrees} observed; ${project.eligible} eligible; ${project.retained} retained; ${project.analysisFailed} analysis failed; ${project.staleRegistrations} stale registrations${project.policyCurrent ? '' : ' (previous policy)'}`;
         process.stdout.write(`Worktree backlog for ${project.project}: ${summary}\n`);
+        if (project.eligible && !project.eligibleCandidates) process.stdout.write('  Candidate ranking unavailable\n');
+        for (const candidate of project.eligibleCandidates ?? []) {
+          const allocation = candidate.estimatedReclaimableBytes === null ? 'allocation unavailable' : `${candidate.estimatedReclaimableBytes} estimated reclaimable bytes`;
+          process.stdout.write(`  ${JSON.stringify(candidate.path)} (${candidate.decisionId}) has ${candidate.logicalBytes} logical bytes, ${allocation}, ${candidate.rebuildFiles} files to recreate\n`);
+        }
       }
       for (const artifact of output.artifacts) process.stdout.write(`  Artifact ${artifact.artifactId}: ${artifact.logicalBytes ?? 'unavailable'} logical bytes; observed growth ${artifact.growthBytes ?? 'unavailable'} bytes\n`);
       process.stdout.write(`Artifact purges: ${output.artifactPurges.observedActions} actions; ${output.artifactPurges.logicalBytes ?? 'unavailable'} logical bytes; ${output.artifactPurges.unavailableTimeActions} actions with unavailable time\n`);

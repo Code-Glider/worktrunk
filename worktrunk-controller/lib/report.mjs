@@ -221,11 +221,17 @@ export function report(config, store, { from, to, now = Date.now() }) {
     backlog: scans.map(scan => {
       const failed = scan.status === 'analysis_failed';
       const decisions = failed ? null : scan.decisions;
+      const policyCurrent = scan.policyGeneration === config.generation;
+      const eligibleCandidates = !failed && policyCurrent && scan.eligibleCandidates ? [...scan.eligibleCandidates].sort((a, b) =>
+        (b.estimatedReclaimableBytes ?? -1) - (a.estimatedReclaimableBytes ?? -1) ||
+        (a.estimatedReclaimableBytes === null ? b.logicalBytes - a.logicalBytes : 0) ||
+        a.rebuildFiles - b.rebuildFiles || a.path.localeCompare(b.path)) : null;
       return {
-        project: scan.project, observedAt: scan.observedAt ?? null, policyCurrent: scan.policyGeneration === config.generation,
+        project: scan.project, observedAt: scan.observedAt ?? null, policyCurrent,
         status: failed ? 'analysis_failed' : 'observed', ...(failed ? { error: scan.error } : {}),
         worktrees: decisions?.length ?? null,
         eligible: decisions?.filter(item => item.status === 'eligible').length ?? null,
+        eligibleCandidates,
         retained: decisions?.filter(item => item.status === 'retain').length ?? null,
         analysisFailed: decisions?.filter(item => item.status === 'analysis_failed').length ?? null,
         staleRegistrations: decisions?.filter(item => item.reasons.includes('stale_registration_report_only')).length ?? null,

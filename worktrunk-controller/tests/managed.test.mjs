@@ -244,8 +244,11 @@ test('worktree cleanup intent owns the checkout and repository through quarantin
   const { s, tracked, raw, config, store, project, fixtures, read, accept } = worktreeFixture(t);
   try {
     for (const issue of [7, 8]) await accept(issue);
-    const candidates = scanProject(config, store, project).decisions.filter(decision => decision.status === 'eligible');
+    const scan = scanProject(config, store, project);
+    const candidates = scan.decisions.filter(decision => decision.status === 'eligible');
     assert.equal(candidates.length, 2, JSON.stringify(candidates));
+    assert.deepEqual(scan.eligibleCandidates.map(candidate => [candidate.decisionId, candidate.path, candidate.logicalBytes, candidate.rebuildFiles]),
+      candidates.map(decision => [decision.id, decision.path, fs.statSync(path.join(decision.path, tracked)).size, 1]));
     store.transaction(tx => { for (const decision of candidates) tx.put('decision', decision.id, { version: 1, ...decision, policyGeneration: config.generation }); });
     const [selected, other] = candidates;
     const independent = path.join(s.base, 'independent');
