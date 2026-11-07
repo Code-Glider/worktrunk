@@ -41,8 +41,18 @@ export function reserve(store, request) {
   const targets = roots(request.roots), owner = text(request.owner, 'owner'), sessionId = text(request.sessionId, 'sessionId');
   return store.transaction(tx => {
     if (conflicts(tx, targets, false)) throw new Error('Cleanup claim blocks producer admission');
+    const task = request.task;
+    const producers = tx.list('claim').map(row => row.value).filter(claim => claim.kind === 'producer');
+    if (task && producers.some(claim => claim.task?.taskKey === task.taskKey && claim.task.attempt === task.attempt)) throw new Error('GitHub issue attempt already has a launch claim');
+    if (producers.some(claim => {
+      if (claim.state === 'ended') return false;
+      try {
+        return (task && claim.roots.some(root => fences(tx, claim, root).some(path => overlap(path, targets[0].path)))) ||
+          (claim.task && fences(tx, claim, claim.roots[0]).some(path => targets.some(root => overlap(path, root.path))));
+      } catch { return true; }
+    })) throw new Error('A managed task requires exclusive producer admission for its checkout');
     const token = randomUUID();
-    const record = { version: 1, token, kind: 'producer', state: 'reserved', owner, sessionId, roots: targets, evidence: null };
+    const record = { version: 1, token, kind: 'producer', state: 'reserved', owner, sessionId, roots: targets, evidence: null, ...(task ? { task } : {}) };
     tx.put('claim', token, record);
     return record;
   });
@@ -50,7 +60,7 @@ export function reserve(store, request) {
 
 const transitions = { reserved: ['starting'], starting: ['running', 'unresolved'], running: ['ended', 'unresolved'] };
 
-export function transition(store, token, expected, next, nativeEvidence) {
+export function transition(store, token, expected, next, nativeEvidence, endedHead) {
   return store.transaction(tx => {
     const record = tx.get('claim', text(token, 'claim token'))?.value;
     if (!record || record.kind !== 'producer' || record.state !== expected || !transitions[expected]?.includes(next)) throw new Error('Invalid producer transition');
@@ -59,6 +69,12 @@ export function transition(store, token, expected, next, nativeEvidence) {
       if (next === 'ended' && (nativeEvidence.activeProcesses !== 1 || digest(record.evidence) !== digest({ ...nativeEvidence, activeProcesses: null }))) throw new Error('Native job completion does not match admitted lifetime');
     }
     const value = { ...record, state: next, evidence: nativeEvidence ?? record.evidence };
+    if (record.task && next === 'running') value.admittedAt = Date.now();
+    if (record.task && next === 'ended') {
+      if (!/^[a-f0-9]{40}$/.test(endedHead ?? '')) throw new Error('Managed task completion requires a full GitHub commit ID');
+      value.endedAt = Date.now();
+      value.endedHead = endedHead;
+    }
     tx.put('claim', token, value);
     return value;
   });

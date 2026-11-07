@@ -76,6 +76,22 @@ test('a moved root retains its native ownership and a recreated path cannot shed
   assert.equal(inactive(s.store, s.root), false);
 });
 
+test('issue-bound checkout exclusivity rejects moved active producer roots in either admission order', t => {
+  for (const boundFirst of [false, true]) {
+    const s = setup(t), moved = path.join(s.base, 'moved'), other = path.join(s.base, 'other');
+    fs.mkdirSync(other);
+    const task = { taskKey: 'issue', attempt: 1 };
+    const first = reserve(s.store, { roots: [s.root], owner: 'host', sessionId: 'first', task: boundFirst ? task : undefined });
+    const second = root => reserve(s.store, { roots: [root], owner: 'host', sessionId: 'second', task: boundFirst ? undefined : task });
+    assert.throws(() => second(s.root), /exclusive producer admission/);
+    fs.renameSync(s.root, moved);
+    fs.mkdirSync(s.root);
+    assert.throws(() => second(moved), /exclusive producer admission/);
+    assert.throws(() => second(other), /exclusive producer admission/);
+    assert.deepEqual(s.store.list('claim').map(row => row.id), [first.token]);
+  }
+});
+
 test('a moved child cleanup claim blocks admission to its new parent and unrelated unknown topology', t => {
   const s = setup(t), other = path.join(s.base, 'other'); fs.mkdirSync(other);
   const original = path.join(s.root, 'child');

@@ -5,12 +5,12 @@ import { parseArgs } from 'node:util';
 import { loadConfig } from '../lib/config.mjs';
 import { Store } from '../lib/store.mjs';
 import { invocation } from '../lib/invoke.mjs';
-import { enroll, inspectIdentity } from '../lib/identity.mjs';
+import { enroll } from '../lib/identity.mjs';
 import { scanProject } from '../lib/observe.mjs';
 import { localPath } from '../lib/paths.mjs';
 import { ingest, syncGitHubIssue } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
-import { runManaged } from '../lib/managed.mjs';
+import { managedCheckout, runManaged } from '../lib/managed.mjs';
 import { enrollArtifact, inspectArtifact } from '../lib/artifacts.mjs';
 import { quarantineArtifact, restore, reconcile, inspectQuarantine, purgeArtifact } from '../lib/actions.mjs';
 
@@ -31,16 +31,20 @@ function utcDate(value) {
   return at;
 }
 
+const positiveNumber = value => /^[1-9]\d*$/.test(value ?? '') && Number.isSafeInteger(Number(value));
+
 try {
-  const { values, positionals } = parseArgs({ options: { config: { type: 'string' }, project: { type: 'string' }, artifact: { type: 'string' }, decision: { type: 'string' }, action: { type: 'string' }, path: { type: 'string' }, source: { type: 'string' }, issue: { type: 'string' }, session: { type: 'string' }, program: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, format: { type: 'string', default: 'text' } }, allowPositionals: true });
+  const { values, positionals } = parseArgs({ options: { config: { type: 'string' }, project: { type: 'string' }, artifact: { type: 'string' }, decision: { type: 'string' }, action: { type: 'string' }, path: { type: 'string' }, source: { type: 'string' }, issue: { type: 'string' }, attempt: { type: 'string' }, agent: { type: 'string' }, session: { type: 'string' }, program: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, format: { type: 'string', default: 'text' } }, allowPositionals: true });
   const [command, ...extra] = positionals;
-  const allowed = { scan: ['project', 'action'], enroll: ['project', 'path'], 'enroll-artifact': ['artifact'], ingest: ['source'], 'sync-github-issue': ['source', 'issue'], report: ['project', 'from', 'to'], run: ['project', 'path', 'session', 'program'], apply: ['decision'], purge: ['decision'], restore: ['action'], reconcile: ['action'] };
-  if ((extra.length && command !== 'run') || !Object.hasOwn(allowed, command) || !values.config || !['json', 'text'].includes(values.format)) throw new Error('Usage: node worktrunk-controller/bin/controller.mjs scan|enroll|enroll-artifact|ingest|sync-github-issue|report|run|apply|purge|restore|reconcile --config <absolute-file> [--project <id>] [--artifact <id>] [--decision <id>] [--action <id>] [--path <absolute-worktree>] [--source <id>] [--issue <number>] [--from YYYY-MM-DD --to YYYY-MM-DD] [--format json|text] [--session <id> --program <absolute-executable> -- <args>...]');
+  const allowed = { scan: ['project', 'action'], enroll: ['project', 'path'], 'enroll-artifact': ['artifact'], ingest: ['source'], 'sync-github-issue': ['source', 'issue'], report: ['project', 'from', 'to'], run: ['project', 'path', 'session', 'program', 'source', 'issue', 'attempt', 'agent'], apply: ['decision'], purge: ['decision'], restore: ['action'], reconcile: ['action'] };
+  if ((extra.length && command !== 'run') || !Object.hasOwn(allowed, command) || !values.config || !['json', 'text'].includes(values.format)) throw new Error('Usage: node worktrunk-controller/bin/controller.mjs scan|enroll|enroll-artifact|ingest|sync-github-issue|report|run|apply|purge|restore|reconcile --config <absolute-file> [--project <id>] [--artifact <id>] [--decision <id>] [--action <id>] [--path <absolute-worktree>] [--source <id>] [--issue <number>] [--attempt <number>] [--agent <id>] [--from YYYY-MM-DD --to YYYY-MM-DD] [--format json|text] [--session <id> --program <absolute-executable> -- <args>...]');
   if (Object.keys(values).some(key => !['config', 'format', ...allowed[command]].includes(key))) throw new Error('Option is not supported for this command');
   if (['enroll', 'run'].includes(command) !== Boolean(values.path) || (['enroll', 'run'].includes(command) && !values.project)) throw new Error('Enrollment/managed run require --project and --path');
   if (command === 'run' && (!values.session || !values.program)) throw new Error('Managed run requires --session and --program');
+  const bindTask = command === 'run' && ['source', 'issue', 'attempt', 'agent'].some(option => Object.hasOwn(values, option));
+  if (bindTask && (!values.source || !positiveNumber(values.issue) || !positiveNumber(values.attempt))) throw new Error('Managed task requires --source, --issue and --attempt');
   if (command === 'ingest' && !values.source) throw new Error('Ingestion requires a configured --source and one JSON event on stdin');
-  if (command === 'sync-github-issue' && (!values.source || !/^[1-9]\d*$/.test(values.issue ?? '') || !Number.isSafeInteger(Number(values.issue)))) throw new Error('GitHub issue sync requires --source and a positive --issue number');
+  if (command === 'sync-github-issue' && (!values.source || !positiveNumber(values.issue))) throw new Error('GitHub issue sync requires --source and a positive --issue number');
   if (command === 'enroll-artifact' && !values.artifact) throw new Error('Artifact enrollment requires a configured --artifact');
   if (['apply', 'purge'].includes(command) && !values.decision) throw new Error('Apply/purge require one explicit --decision');
   if (command === 'scan' && values.action && values.project) throw new Error('Scan selects either --action or --project');
@@ -63,13 +67,9 @@ try {
     else if (command === 'enroll-artifact') output = enrollArtifact(config, store, values.artifact);
     else if (command === 'run') {
       const project = projects[0];
-      const root = invocation(config, project.root, ({ git }) => {
-        const root = localPath(values.path);
-        if (localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir'], root).trim()) !== localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim()) || localPath(git(['rev-parse', '--show-toplevel'], root).trim()) !== root) throw new Error('Managed run requires an exact registered worktree root');
-        if (!inspectIdentity(store, root, git(['rev-parse', '--absolute-git-dir'], root).trim())) throw new Error('Managed run requires explicit matching enrollment');
-        return root;
-      });
-      output = await runManaged(config, store, { root, projectId: project.id, sessionId: values.session, program: values.program, args: extra });
+      const github = bindTask ? { source: values.source, issue: Number(values.issue), attempt: Number(values.attempt), agentId: values.agent } : undefined;
+      const root = bindTask ? values.path : managedCheckout(config, store, project, values.path).root;
+      output = await runManaged(config, store, { root, projectId: project.id, sessionId: values.session, program: values.program, args: extra, github });
       if (output.exitCode !== 0) process.exitCode = output.exitCode ?? 1;
     } else if (command === 'enroll') {
       const project = projects[0];

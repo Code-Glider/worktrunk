@@ -14,26 +14,44 @@ function weekStart(at) {
   return date.toISOString().slice(0, 10);
 }
 
-function taskProjection(key, events, now, githubIssue) {
-  const isGitHub = events[0].authority === 'github.com/issues';
+function taskProjection(key, events, now, githubIssue, launches) {
+  const task = events[0] ?? { ...launches[0].task, authority: 'github.com/issues' };
+  const isGitHub = task.authority === 'github.com/issues';
   const attempts = new Map();
   for (const event of events) if (event.attemptId) {
     const rows = attempts.get(event.attemptId) ?? [];
     rows.push(event); attempts.set(event.attemptId, rows);
   }
+  const launchByAttempt = new Map(launches.map(launch => [String(launch.task.attempt), launch]));
+  for (const id of launchByAttempt.keys()) if (!attempts.has(id)) attempts.set(id, []);
   const projected = [...attempts.entries()].map(([id, rows]) => {
+    const launch = launchByAttempt.get(id);
     const numbers = new Set(rows.map(row => row.attemptNumber));
+    if (launch) numbers.add(launch.task.attempt);
     const terminals = rows.filter(row => terminalTypes.has(row.type));
     const outcomes = new Set(terminals.map(row => terminalTypes.get(row.type)));
     const conflictingHeads = isGitHub && new Set(terminals.map(row => row.head)).size > 1;
-    return { id, number: numbers.size === 1 ? rows[0].attemptNumber : null, startedAt: firstTime(rows.filter(row => row.type === 'attempt_started')), terminal: outcomes.size > 1 || conflictingHeads ? 'ambiguous' : ([...outcomes][0] ?? null), terminalAt: firstTime(terminals) };
+    return {
+      id, number: numbers.size === 1 ? [...numbers][0] : null,
+      startedAt: launch?.admittedAt ?? firstTime(rows.filter(row => row.type === 'attempt_started')),
+      terminal: outcomes.size > 1 || conflictingHeads ? 'ambiguous' : ([...outcomes][0] ?? null), terminalAt: firstTime(terminals),
+      ...(launch ? { managed: { worktreeId: launch.task.worktreeId, endedAt: launch.endedAt, head: launch.endedHead } } : {}),
+    };
   }).sort((a, b) => (a.number ?? Infinity) - (b.number ?? Infinity) || a.id.localeCompare(b.id));
   const accepted = events.filter(event => event.type === 'attempt_accepted');
   const firstAcceptedAt = firstTime(accepted);
   const acceptedRows = accepted.filter(event => event.at === firstAcceptedAt);
   const agents = new Set(acceptedRows.map(row => JSON.stringify(row.agentIds)));
-  const agentIds = agents.size === 1 && acceptedRows.every(row => row.attemptId) ? acceptedRows[0].agentIds : [];
-  const startedAt = firstTime(events.filter(event => event.type === 'task_started'));
+  const acceptedLaunch = launchByAttempt.get(acceptedRows[0]?.attemptId);
+  const matchedLaunch = acceptedLaunch && acceptedRows.every(row => row.attemptNumber === acceptedLaunch.task.attempt &&
+    row.sourceInstance === acceptedLaunch.task.sourceInstance && row.project === acceptedLaunch.task.project &&
+    row.head === acceptedLaunch.endedHead && row.at >= acceptedLaunch.endedAt);
+  const firstLaunch = launchByAttempt.get('1');
+  const projectConflict = new Set([...events.map(event => event.project), ...launches.map(launch => launch.task.project)]).size !== 1;
+  const agentIds = isGitHub
+    ? matchedLaunch && !projectConflict && acceptedLaunch.task.agentId ? [acceptedLaunch.task.agentId] : []
+    : agents.size === 1 && acceptedRows.every(row => row.attemptId) ? acceptedRows[0].agentIds : [];
+  const startedAt = isGitHub ? firstLaunch?.admittedAt ?? null : firstTime(events.filter(event => event.type === 'task_started'));
   const currentAcceptance = new Set(githubIssue?.acceptances);
   const stateRows = events.filter(event => {
     if (event.type === 'task_reopened' || event.type === 'task_revoked') return true;
@@ -41,7 +59,6 @@ function taskProjection(key, events, now, githubIssue) {
   }).sort(order);
   const latest = stateRows.at(-1);
   const ambiguousClock = events.some(event => event.at === null || event.at > now);
-  const projectConflict = new Set(events.map(event => event.project)).size !== 1;
   const lastReopen = stateRows.findLast(event => event.type === 'task_reopened');
   const hasCurrentConflict = isGitHub
     ? latest?.type === 'attempt_accepted' && new Set(stateRows.filter(event => event.type === 'attempt_accepted' && event.attemptId === latest.attemptId && event.at >= (lastReopen?.at ?? 0)).map(event => event.head)).size > 1
@@ -51,11 +68,13 @@ function taskProjection(key, events, now, githubIssue) {
   const firstAttempt = ordinalKnown ? projected.find(attempt => attempt.number === 1) ?? null : null;
   const sameTimeConflict = latest && stateRows.some(event => event.at === latest.at && event.type !== latest.type);
   return {
-    id: key, authority: events[0].authority, authorityProject: events[0].authorityProject, taskId: events[0].taskId, project: events[0].project,
+    id: key, authority: task.authority, authorityProject: task.authorityProject, taskId: task.taskId, project: task.project,
     ...(isGitHub ? { authorityObservedAt: githubIssue?.observedAt ?? null } : {}),
     startedAt, firstAcceptedAt, currentOutcome: ambiguousClock || projectConflict || hasCurrentConflict || sameTimeConflict || !latest ? 'unknown' : latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked',
     agentIds, attribution: agentIds.length === 1 ? 'single_agent' : agentIds.length > 1 ? 'multiple_agents' : 'unavailable',
-    durationMs: !ambiguousClock && !projectConflict && !invalidOrdering && startedAt !== null && firstAcceptedAt !== null ? firstAcceptedAt - startedAt : null,
+    durationMs: !ambiguousClock && !projectConflict && !invalidOrdering && startedAt !== null && firstAcceptedAt !== null &&
+      (!isGitHub || (matchedLaunch && firstLaunch.task.sourceInstance === acceptedLaunch.task.sourceInstance && startedAt <= acceptedLaunch.admittedAt))
+      ? firstAcceptedAt - startedAt : null,
     attempts: projected, observedAttempts: projected.length, observedRetries: projected.length ? projected.length - 1 : null,
     firstAttempt: projectConflict || ambiguousClock || invalidOrdering || !firstAttempt || firstAttempt.terminal === 'ambiguous' ? null : firstAttempt,
     openAgeMs: !latest && startedAt !== null && startedAt <= now && !ambiguousClock ? now - startedAt : null,
@@ -127,7 +146,18 @@ export function report(config, store, { from, to, now = Date.now() }) {
     const source = githubSources.get(row.value.sourceInstance);
     return source && digest(store.get('event_source', source.instance)?.value.source ?? null) === digest(source) && row.value.observedAt <= now;
   }).map(row => [row.value.taskKey, row.value]));
-  const tasks = [...taskGroups].map(([key, rows]) => taskProjection(key, rows, now, githubIssues.get(key))).sort((a, b) => a.id.localeCompare(b.id));
+  const launches = new Map();
+  for (const { value } of store.list('claim')) {
+    const task = value.task;
+    if (value.kind !== 'producer' || value.state !== 'ended' || !task || !registered.has(task.project) ||
+      value.evidence?.kind !== 'windows_job' || value.evidence.launchToken !== value.token || value.evidence.activeProcesses !== 1 ||
+      !/^[a-f0-9]{40}$/.test(value.endedHead ?? '') || !Number.isSafeInteger(value.admittedAt) || !Number.isSafeInteger(value.endedAt) ||
+      value.admittedAt < 0 || value.endedAt < value.admittedAt || value.endedAt > now) continue;
+    const rows = launches.get(task.taskKey) ?? [];
+    rows.push(value); launches.set(task.taskKey, rows);
+    if (!taskGroups.has(task.taskKey)) taskGroups.set(task.taskKey, []);
+  }
+  const tasks = [...taskGroups].map(([key, rows]) => taskProjection(key, rows, now, githubIssues.get(key), launches.get(key) ?? [])).sort((a, b) => a.id.localeCompare(b.id));
   const sessions = [...sessionGroups].map(([key, rows]) => sessionProjection(key, rows, allEvents.filter(event => event.sourceInstance === rows[0].sourceInstance && event.sequence !== null).map(event => event.sequence), from, to)).sort((a, b) => a.id.localeCompare(b.id));
   const cohorts = new Map();
   const acceptedTasks = tasks.filter(task => inWindow(task.firstAcceptedAt, from, to) && task.timingStatus !== 'unavailable');

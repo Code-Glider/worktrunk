@@ -10,8 +10,11 @@ import { fileURLToPath } from 'node:url';
 import { Store } from '../lib/store.mjs';
 import { acquireCleanup, inactive, releaseCleanup } from '../lib/admission.mjs';
 import { enrollArtifact } from '../lib/artifacts.mjs';
+import { loadConfig } from '../lib/config.mjs';
+import { enroll } from '../lib/identity.mjs';
 import { runManaged } from '../lib/managed.mjs';
-import { controller, fixture, nativeWorktrunk } from './helpers.mjs';
+import { report } from '../lib/report.mjs';
+import { controller, fixture, git, nativeWorktrunk } from './helpers.mjs';
 
 const host = nativeWorktrunk('wt-controller-host');
 const binary = process.platform === 'win32' ? nativeWorktrunk() : null;
@@ -201,6 +204,7 @@ test('managed CLI requires enrollment and a pinned host, preserves arguments and
   const run = (command, extra = []) => spawnSync(process.execPath, [cli, command, ...args, ...extra], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
   const sentinel = path.join(s.root, 'sentinel');
   const command = ['--session', 'explicit-session', '--program', process.execPath, '--', '-e', `require('fs').writeFileSync(${JSON.stringify(sentinel)},process.argv[1]);console.log('{"type":"ended"}');process.exitCode=7;`, '--', '--literal argument א'];
+  assert.match(run('run', ['--issue', '7', ...command]).stderr, /--source.*--issue.*--attempt/);
   const unenrolled = run('run', command);
   assert.equal(unenrolled.status, 1); assert.match(unenrolled.stderr, /matching enrollment/); assert.equal(fs.existsSync(sentinel), false);
   assert.equal(run('enroll').status, 0);
@@ -215,4 +219,74 @@ test('managed CLI requires enrollment and a pinned host, preserves arguments and
   assert.match(completed.stderr, /"type":"ended"/);
   assert.equal(JSON.parse(completed.stdout).exitCode, 7);
   assert.equal(fs.readFileSync(sentinel, 'utf8'), '--literal argument א');
+});
+
+test('native managed launch binds one enrolled checkout and captures the final commit', { skip: process.platform !== 'win32' }, async t => {
+  const s = controller(t, binary);
+  const root = path.join(s.base, 'checkout'), ready = path.join(s.base, 'ready'), gate = path.join(s.base, 'gate');
+  git(s.root, 'worktree', 'add', '-b', 'agent', root);
+  const gitDir = git(root, 'rev-parse', '--absolute-git-dir');
+  const initialHead = git(root, 'rev-parse', 'HEAD');
+  const value = JSON.parse(fs.readFileSync(s.filename, 'utf8'));
+  value.nativeHost = { path: host, version: 1, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex') };
+  value.eventSources = [{ id: 'issues', instance: 'issues-1', role: 'task', projects: ['myproject'], github: { repository: 'owner/repo', repositoryId: 22, acceptorIds: [5] } }];
+  fs.writeFileSync(s.filename, JSON.stringify(value));
+  const config = loadConfig(s.filename);
+  let store;
+  store = new Store(path.join(fixture(t, () => store?.close()), 'state'));
+  const response = {
+    'repos/owner/repo': { id: 22, full_name: 'Owner/Repo' },
+    'repos/owner/repo/issues/7': { id: 38, number: 7, repository_url: 'https://api.github.com/repos/owner/repo' },
+    'repos/owner/repo/issues/7/timeline?per_page=100': [[]],
+  };
+  const read = async endpoint => { assert.ok(Object.hasOwn(response, endpoint), endpoint); return response[endpoint]; };
+  const agent = `
+    const fs = require('fs');
+    fs.writeFileSync(${JSON.stringify(ready)}, '');
+    const wait = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(gate)})) return;
+      clearInterval(wait);
+      require('child_process').execFileSync('git', ['-c', 'user.name=Agent', '-c', 'user.email=agent@example.test', 'commit', '--allow-empty', '-m', 'Agent result'], { env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: ${JSON.stringify(path.join(s.base, 'empty-gitconfig'))} } });
+      process.exitCode = 7;
+    }, 20);
+  `;
+  const launch = { root, projectId: 'myproject', sessionId: 'bound', program: process.execPath, args: ['-e', agent], github: { source: 'issues', issue: 7, attempt: 1, agentId: 'agent-a' } };
+  const copied = path.join(s.base, 'copied-checkout');
+  fs.mkdirSync(copied);
+  fs.copyFileSync(path.join(root, '.git'), path.join(copied, '.git'));
+  await assert.rejects(runManaged(config, store, { ...launch, root: copied }, () => assert.fail('Unregistered checkout reached GitHub')), /exact registered worktree root/);
+  await assert.rejects(runManaged(config, store, launch, () => assert.fail('Unenrolled checkout reached GitHub')), /matching enrollment/);
+  const enrollment = enroll(store, root, gitDir);
+  const running = runManaged(config, store, launch, read);
+  running.catch(() => {});
+  try {
+    await until(() => fs.existsSync(ready));
+    const claim = store.list('claim')[0].value;
+    assert.equal(claim.state, 'running');
+    assert.equal(claim.endedHead, undefined);
+    assert.equal(report(config, store, { from: 0, to: Date.now() }).tasks.length, 0);
+    const second = { ...launch, sessionId: 'second', args: ['-e', 'process.exit(99)'] };
+    await assert.rejects(runManaged(config, store, second, read), /already has a launch claim/);
+    await assert.rejects(runManaged(config, store, { ...second, github: undefined }), /exclusive producer admission/);
+  } finally { fs.writeFileSync(gate, ''); await running; }
+  const result = await running, claim = store.get('claim', result.token).value;
+  assert.equal(result.exitCode, 7);
+  assert.equal(claim.state, 'ended');
+  assert.equal(claim.task.worktreeId, enrollment.id);
+  assert.equal(claim.task.taskId, '38');
+  assert.equal(claim.task.attempt, 1);
+  assert.ok(claim.endedAt >= claim.admittedAt);
+  assert.equal(claim.endedHead, git(root, 'rev-parse', 'HEAD'));
+  assert.notEqual(claim.endedHead, initialHead);
+  const task = report(config, store, { from: 0, to: Date.now() }).tasks[0];
+  assert.equal(task.currentOutcome, 'unknown');
+  assert.equal(task.attempts[0].managed.head, claim.endedHead);
+  assert.equal(task.attempts[0].terminal, null);
+  const marker = path.join(gitDir, 'worktrunk-controller-worktree.json');
+  const changed = async endpoint => {
+    if (endpoint.includes('/timeline?')) fs.renameSync(marker, `${marker}.replaced`);
+    return read(endpoint);
+  };
+  await assert.rejects(runManaged(config, store, { ...launch, github: { ...launch.github, attempt: 2 } }, changed), /matching enrollment/);
+  assert.equal(store.list('claim').length, 1);
 });

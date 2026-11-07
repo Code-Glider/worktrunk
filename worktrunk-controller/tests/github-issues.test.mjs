@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { digest } from '../lib/data.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { ingest, syncGitHubIssue } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
@@ -102,6 +103,44 @@ test('a late response cannot overwrite a concurrently committed issue snapshot',
   await pending;
   assert.equal(read().tasks[0].currentOutcome, 'reopened');
   assert.equal(store.list('event').length, 1);
+});
+
+test('throughput uses only matching ended launches and keeps GitHub authoritative', async t => {
+  const { store, sync, read } = setup(t);
+  const acceptedAt = Date.parse(start);
+  function launch(attempt, changes = {}) {
+    const token = `claim-${attempt}`;
+    const task = { taskKey: digest(['github.com/issues', '22', '38']), sourceInstance: source.instance, project: 'myproject', issue: 7, taskId: '38', authorityProject: '22', attempt, agentId: 'agent-a', worktreeId: 'worktree-1' };
+    store.transaction(tx => tx.put('claim', token, { version: 1, token, kind: 'producer', state: 'ended', task, admittedAt: acceptedAt - 5000 + 1000 * attempt, endedAt: acceptedAt - 1000, endedHead: head, evidence: { kind: 'windows_job', launchToken: token, activeProcesses: 1 }, ...changes }));
+  }
+  const retry = { ...comment, body: `/worktrunk accept 2 ${head}` };
+  launch(2, { state: 'unresolved' });
+  await sync([[retry]]);
+  assert.equal(read().observedFirstAcceptedTasks, 1);
+  assert.equal(read().tasks[0].attribution, 'unavailable');
+  assert.equal(read().tasks[0].attempts[0].managed, undefined);
+  launch(2, { endedHead: 'b'.repeat(40) });
+  assert.equal(read().tasks[0].attribution, 'unavailable');
+  launch(2, { endedAt: acceptedAt + 1 });
+  assert.equal(read().tasks[0].attribution, 'unavailable');
+  launch(2);
+  assert.deepEqual(read().tasks[0].agentIds, ['agent-a']);
+  assert.equal(read().tasks[0].durationMs, null);
+  launch(1, { endedAt: acceptedAt - 3500 });
+  const result = read();
+  assert.equal(result.tasks[0].durationMs, 4000);
+  assert.equal(result.tasks[0].observedRetries, 1);
+  assert.equal(result.tasks[0].attempts[0].terminal, null);
+  assert.equal(result.firstAttemptOutcomes.total, 0);
+  assert.equal(result.acceptedTaskDuration.samples, 1);
+  assert.equal(result.attribution.singleAgent['agent-a'], 1);
+  assert.equal(result.coverage[0].status, 'partial_unmeasured');
+  await sync([[retry, { ...comment, id: 45 }]]);
+  assert.equal(read().tasks[0].attribution, 'unavailable');
+  assert.equal(read().tasks[0].durationMs, null);
+  await sync([[retry, reopened]]);
+  assert.equal(read().tasks[0].currentOutcome, 'reopened');
+  assert.equal(read().worktreeApplyEnabled, false);
 });
 
 test('wrong repository, pull request, malformed pages and conflicting replay leave evidence intact', async t => {
