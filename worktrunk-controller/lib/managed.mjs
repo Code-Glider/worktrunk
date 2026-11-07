@@ -15,11 +15,12 @@ export function managedCheckout(config, store, project, root, readHead = false) 
   return invocation(config, project.root, ({ git }) => {
     root = localPath(root);
     const common = localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir'], root).trim());
+    const worktrees = worktreeInventory(git);
     if (common !== localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim()) || localPath(git(['rev-parse', '--show-toplevel'], root).trim()) !== root ||
-      !worktreeInventory(git).some(entry => !entry.prunable && path.relative(root, entry.path) === '' && localPath(entry.path) === root)) throw new Error('Managed run requires an exact registered worktree root');
+      !worktrees.some(entry => !entry.prunable && path.relative(root, entry.path) === '' && localPath(entry.path) === root)) throw new Error('Managed run requires an exact registered worktree root');
     const identity = inspectIdentity(store, root, git(['rev-parse', '--absolute-git-dir'], root).trim());
     if (!identity) throw new Error('Managed run requires explicit matching enrollment');
-    const checkout = { root, worktreeId: identity.value.id, repositoryIncarnation: fileIdentity(common) };
+    const checkout = { root, worktreeId: identity.value.id, repositoryIncarnation: fileIdentity(common), common, worktrees };
     if (readHead) checkout.head = git(['rev-parse', '--verify', 'HEAD^{commit}'], root).trim();
     return checkout;
   });

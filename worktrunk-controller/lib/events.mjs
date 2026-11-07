@@ -15,6 +15,10 @@ export function ingest(config, store, sourceId, payload, observedAt = Date.now()
 }
 
 export async function syncGitHubIssue(config, store, sourceId, issueNumber, request = githubGet) {
+  return (await syncGitHubIssueSnapshot(config, store, sourceId, issueNumber, request)).result;
+}
+
+export async function syncGitHubIssueSnapshot(config, store, sourceId, issueNumber, request = githubGet) {
   const source = config.eventSources.find(source => source.id === sourceId);
   if (!source?.github) throw new Error('Select a configured GitHub issue source');
   integer(issueNumber, 'GitHub issue number', 1);
@@ -31,8 +35,8 @@ export async function syncGitHubIssue(config, store, sourceId, issueNumber, requ
     if (tx.get('github_issue', key)?.revision !== revision) throw new Error('A concurrent GitHub issue sync superseded this read');
     const results = events.map(event => recordEvent(tx, source, event, observedAt));
     if (!binding && !events.length) tx.put('event_source', source.instance, { version: 1, source });
-    tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, taskKey, readStartedAt, observedAt, acceptances });
-    return { version: 1, source: source.id, issue: issueNumber, taskId, recorded: results.filter(result => !result.replay).length, replayed: results.filter(result => result.replay).length };
+    const issueRevision = tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, taskKey, readStartedAt, observedAt, acceptances });
+    return { issueRevision, result: { version: 1, source: source.id, issue: issueNumber, taskId, recorded: results.filter(result => !result.replay).length, replayed: results.filter(result => result.replay).length } };
   });
 }
 

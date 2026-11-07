@@ -103,5 +103,5 @@ export function loadConfig(filename) {
     return { ...binding, authority: 'github.com/issues', github: { repository: repository.toLowerCase(), repositoryId: github.repositoryId, acceptorIds } };
   });
   const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, nativeHost, projects, stateDir, quarantineDir, policy, limits, artifactRoots, eventSources };
-  return { ...normalized, generation: digest(normalized), configPath: localPath(filename) };
+  return { ...normalized, generation: digest(normalized), configPath: localPath(filename), registryPath };
 }

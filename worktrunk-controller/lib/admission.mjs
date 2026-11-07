@@ -17,6 +17,9 @@ function fences(tx, claim, root) {
     if (digest(fileIdentity(path.dirname(root.path))) !== digest(action.originalParent)) throw new Error('Cleanup parent changed');
     const containerPath = localPath(action.containerPath, { missing: true });
     result.push(containerPath);
+    if (action.kind === 'worktree' && action.phase === 'intent') {
+      for (const checkoutPath of action.repositoryPaths) result.push(localPath(checkoutPath, { missing: true }));
+    }
     if (action.containerIdentity) {
       if (digest(fileIdentity(containerPath)) !== digest(action.containerIdentity)) throw new Error('Cleanup container changed');
     } else if (fs.existsSync(containerPath)) throw new Error('Cleanup container is unverified');

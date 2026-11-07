@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../lib/store.mjs';
+import { beginWorktreeAction, reconcile, refreshWorktreeAuthority, verifyWorktreeAction } from '../lib/actions.mjs';
 import { acquireCleanup, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
 import { enrollArtifact } from '../lib/artifacts.mjs';
 import { loadConfig } from '../lib/config.mjs';
@@ -20,6 +21,115 @@ import { controller, fixture, git, nativeWorktrunk } from './helpers.mjs';
 
 const host = nativeWorktrunk('wt-controller-host');
 const binary = process.platform === 'win32' ? nativeWorktrunk() : null;
+
+test('worktree cleanup intent owns the checkout and repository', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {
+  const s = controller(t, binary);
+  git(s.root, 'config', 'worktrunk.default-branch', 'main');
+  const raw = JSON.parse(fs.readFileSync(s.filename, 'utf8'));
+  raw.policy.allowApply = true;
+  raw.nativeHost = { path: host, version: 1, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex') };
+  raw.eventSources = [{ id: 'issues', instance: 'issues-1', role: 'task', projects: ['myproject'], github: { repository: 'owner/repo', repositoryId: 22, acceptorIds: [5] } }];
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  fs.writeFileSync(raw.registry, JSON.stringify({ projects: [{ id: 'myproject', root: s.root, producerAdmission: 'cooperative-windows-job-v1' }] }));
+  const config = loadConfig(s.filename), store = new Store(config.stateDir), project = config.projects[0];
+  try {
+    const fixtures = new Map();
+    const read = async endpoint => {
+      if (endpoint === 'repos/owner/repo') return { id: 22, full_name: 'owner/repo' };
+      const [, issue, tail] = /^repos\/owner\/repo\/issues\/(\d+)(.*)$/.exec(endpoint);
+      if (tail) return [fixtures.get(Number(issue))];
+      return { id: 30 + Number(issue), number: Number(issue), repository_url: 'https://api.github.com/repos/owner/repo' };
+    };
+    for (const issue of [7, 8]) {
+      const branch = `agent-${issue}`, root = path.join(s.base, branch);
+      git(s.root, 'worktree', 'add', '-b', branch, root);
+      enroll(store, root, git(root, 'rev-parse', '--absolute-git-dir'));
+      fixtures.set(issue, []);
+      const launch = await runManaged(config, store, { root, projectId: project.id, sessionId: branch, program: process.execPath, args: ['-e', ''], github: { source: 'issues', issue, attempt: 1 } }, read);
+      const claim = store.get('claim', launch.token).value;
+      const acceptedAt = Math.ceil(claim.endedAt / 1000) * 1000;
+      await until(() => Date.now() >= acceptedAt);
+      const at = new Date(acceptedAt).toISOString().replace('.000Z', 'Z');
+      fixtures.set(issue, [{ event: 'commented', id: 80 + issue, user: { type: 'User', id: 5 }, created_at: at, updated_at: at, body: `/worktrunk accept 1 ${claim.endedHead}` }]);
+      await syncGitHubIssue(config, store, 'issues', issue, read);
+    }
+    const candidates = scanProject(config, store, project).decisions.filter(decision => decision.status === 'eligible');
+    assert.equal(candidates.length, 2, JSON.stringify(candidates));
+    store.transaction(tx => { for (const decision of candidates) tx.put('decision', decision.id, { version: 1, ...decision, policyGeneration: config.generation }); });
+    const [selected, other] = candidates;
+    const independent = path.join(s.base, 'independent');
+    fs.mkdirSync(independent);
+    git(independent, 'init');
+    const action = beginWorktreeAction(config, store, selected.id);
+    assert.equal(action.phase, 'intent');
+    assert.equal(store.get('claim', action.claimToken).value.state, 'held');
+    assert.throws(() => beginWorktreeAction(config, store, other.id), /owner\/cleanup claim/);
+    assert.throws(() => reserve(store, { roots: [selected.path], owner: config.host.id, sessionId: 'competing' }), /Cleanup claim/);
+    assert.throws(() => reserve(store, { roots: [other.path], owner: config.host.id, sessionId: 'sibling' }), /Cleanup claim/);
+    assert.equal(reserve(store, { roots: [independent], owner: config.host.id, sessionId: 'independent' }).state, 'reserved');
+    assert.equal(store.list('action').length, 1);
+    const verify = revision => store.transaction(tx => verifyWorktreeAction(config, tx, action.id, revision));
+    assert.throws(() => verify(action.initialIssueRevision), /snapshot superseded or unavailable/);
+    const fresh = () => refreshWorktreeAuthority(config, store, action.id, read);
+    const revision = await refreshWorktreeAuthority(config, store, action.id, async endpoint => {
+      assert.throws(() => reserve(store, { roots: [other.path], owner: config.host.id, sessionId: 'during-refresh' }), /Cleanup claim/);
+      return read(endpoint);
+    });
+    assert.equal(verify(revision).evidence.taskEvidence.acceptanceId, selected.evidence.taskEvidence.acceptanceId);
+    const newer = await fresh();
+    assert.throws(() => verify(revision), /snapshot superseded/);
+    const protectedFile = path.join(selected.path, 'producer-output.tmp');
+    fs.writeFileSync(protectedFile, 'unique data');
+    assert.throws(() => verify(newer), /untracked_content/);
+    assert.equal(fs.readFileSync(protectedFile, 'utf8'), 'unique data');
+    fs.unlinkSync(protectedFile);
+    git(s.root, 'branch', 'extra-ref');
+    assert.throws(() => verify(newer), /decision changed/);
+    git(s.root, 'branch', '-d', 'extra-ref');
+    const extraCheckout = path.join(s.base, 'extra-checkout');
+    git(s.root, 'worktree', 'add', '--detach', extraCheckout);
+    assert.throws(() => verify(newer), /checkout paths changed/);
+    git(s.root, 'worktree', 'remove', extraCheckout);
+    fs.writeFileSync(s.filename, JSON.stringify({ ...raw, policy: { ...raw.policy, allowApply: false } }));
+    assert.throws(() => verify(newer), /configuration changed/);
+    await assert.rejects(refreshWorktreeAuthority(config, store, action.id, () => assert.fail('Changed policy reached GitHub')), /configuration changed/);
+    fs.writeFileSync(s.filename, JSON.stringify(raw));
+    const [approval] = fixtures.get(action.issue);
+    await until(() => Date.now() >= Date.parse(approval.created_at) + 1000);
+    const reopenedAt = new Date(Date.parse(approval.created_at) + 1000).toISOString().replace('.000Z', 'Z');
+    fixtures.set(action.issue, [approval, { event: 'reopened', id: 101, created_at: reopenedAt }]);
+    const reopened = await fresh();
+    assert.throws(() => verify(reopened), /issue_reopened/);
+    assert.equal(fs.existsSync(config.quarantineDir), false);
+    fs.mkdirSync(action.containerPath, { recursive: true });
+    assert.throws(() => reconcile(config, store, action.id), /Unverified quarantine container/);
+    assert.equal(store.get('claim', action.claimToken).value.state, 'held');
+    fs.rmdirSync(action.containerPath);
+    fs.rmdirSync(action.quarantineRoot);
+    const restarted = new Store(config.stateDir);
+    try {
+      assert.equal(reconcile(config, restarted, action.id).phase, 'cancelled');
+      assert.equal(restarted.get('claim', action.claimToken).value.state, 'released');
+      assert.equal(reconcile(config, restarted, action.id).phase, 'cancelled');
+    } finally { restarted.close(); }
+    assert.equal(git(selected.path, 'rev-parse', 'HEAD'), selected.head);
+    assert.equal(git(other.path, 'rev-parse', 'HEAD'), other.head);
+    const writer = reserve(store, { roots: [other.path], owner: config.host.id, sessionId: 'before-intent' });
+    assert.throws(() => beginWorktreeAction(config, store, selected.id), /owner\/cleanup claim/);
+    const job = { kind: 'windows_job', launchToken: writer.token, helperPid: 1, activeProcesses: null };
+    transition(store, writer.token, 'reserved', 'starting');
+    transition(store, writer.token, 'starting', 'running', job);
+    transition(store, writer.token, 'running', 'ended', { ...job, activeProcesses: 1 });
+    const retry = beginWorktreeAction(config, store, other.id);
+    const late = await refreshWorktreeAuthority(config, store, retry.id, endpoint => {
+      if (endpoint.includes('/timeline?')) reconcile(config, store, retry.id);
+      return read(endpoint);
+    });
+    assert.throws(() => store.transaction(tx => verifyWorktreeAction(config, tx, retry.id, late)), /Unstarted worktree intent required/);
+    assert.equal(store.get('claim', retry.claimToken).value.state, 'released');
+  } finally { store.close(); }
+});
+
 function setup(t) {
   let store;
   const root = fixture(t, () => store?.close()), state = path.join(root, 'state');

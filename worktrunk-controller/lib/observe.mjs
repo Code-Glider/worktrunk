@@ -75,11 +75,13 @@ export function validateObservation(value) {
   return value;
 }
 
-export function scanProject(config, store, project, now = Date.now()) {
+export function scanProject(config, store, project, now = Date.now(), action) {
+  if (action && !store.writing) throw new Error('Worktree action observation requires a write transaction');
   return invocation(config, project.root, ({ git, wt }) => {
     const inventory = worktreeInventory(git);
     const beforeRefs = refVector(git);
-    const commonDir = localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
+    const currentCommonDir = () => localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
+    const commonDir = currentCommonDir();
     const repositoryIncarnation = fileIdentity(commonDir);
     let nativeHost = null;
     if (project.producerAdmission && config.nativeHost && process.platform === 'win32') {
@@ -100,7 +102,8 @@ export function scanProject(config, store, project, now = Date.now()) {
         items.set(key, item);
       }
     } catch (error) { failure = error.message; }
-    let decisions = inventory.map(entry => {
+    const selectedInventory = action ? inventory.filter(entry => path.relative(entry.path, action.originalPath) === '') : inventory;
+    let decisions = selectedInventory.map(entry => {
       const target = { kind: 'worktree', project: project.id, path: entry.path, branch: entry.branch ?? null, head: entry.HEAD ?? null };
       let evidence;
       try {
@@ -126,22 +129,24 @@ export function scanProject(config, store, project, now = Date.now()) {
         // Git status deliberately hides assume-unchanged and skip-worktree content.
         const hiddenIndex = git(['ls-files', '-v', '-z'], root).split('\0').some(record => /^[a-zS] /.test(record));
         const checkout = { path: root, head: entry.HEAD, identity: identity?.id, incarnation, repositoryIncarnation };
-        const gate = identity && !tree.main ? store.transaction(tx => {
+        const readGate = tx => {
           if (inspectIdentity(tx, root, gitDir)?.value.id !== identity.id) throw new Error('Worktree enrollment changed during observation');
           const task = worktreeTaskEvidence(config, tx, project, checkout, now);
-          const producer = worktreeProducerEvidence(tx, project, checkout, nativeHost, task.claimToken);
+          const producer = worktreeProducerEvidence(tx, project, checkout, nativeHost, task.claimToken, action?.claimToken);
           return { task, producer };
-        }) : null;
+        };
+        const gate = identity && !tree.main ? (action ? readGate(store) : store.transaction(readGate)) : null;
         if (digest(incarnation) !== digest(fileIdentity(root))) throw new Error('Worktree incarnation changed during observation');
         evidence = {
           incarnation, gitDir, identity: identity?.id ?? null, enrolledAt: identity?.enrolledAt ?? null,
           main: tree.main, defaultBranch: item.branch === envelope.repo.default_branch, locked: Boolean(entry.locked || tree.locked), stale: false,
-          protectedPath: [process.cwd(), codeRoot, config.stateDir, config.quarantineDir].some(protectedRoot => overlap(root, localPath(protectedRoot, { missing: true }))),
+          protectedPath: [process.cwd(), codeRoot, config.stateDir, config.quarantineDir, config.configPath, config.registryPath, config.worktrunk.path, config.nativeHost?.path,
+            ...config.projects.map(project => project.root), ...config.artifactRoots.map(artifact => artifact.path)].filter(Boolean).some(protectedRoot => overlap(root, localPath(protectedRoot, { missing: true }))),
           integration: integration?.reason ?? null, refs: beforeRefs, targets: envelope.observation.targets,
           hiddenIndex,
           dirty: hiddenIndex ? null : ['staged', 'modified', 'renamed', 'deleted', 'conflicted'].some(key => changes[key]) || records.some(record => /^[12u] /.test(record)),
           untracked: changes.untracked || records.some(record => record.startsWith('? ')), ignored: records.some(record => record.startsWith('! ')),
-          operation: Boolean(tree.operation), nested: contents.nested, links: contents.links, contents,
+          operation: Boolean(tree.operation), nested: contents.nested || inventory.some(other => other !== entry && overlap(root, path.resolve(other.path))), links: contents.links, contents,
           acceptedTask: gate?.task.status === 'accepted', inactiveProducers: gate?.producer.status === 'inactive',
           ...(gate ? { taskEvidence: gate.task, producerEvidence: gate.producer, repositoryIncarnation } : {}),
         };
@@ -149,7 +154,7 @@ export function scanProject(config, store, project, now = Date.now()) {
       } catch (error) { return { ...target, status: 'analysis_failed', reasons: ['observation_unavailable'], error: error.message, evidence: null }; }
     });
     try {
-      if (digest(repositoryIncarnation) !== digest(fileIdentity(commonDir)) || digest(beforeRefs) !== digest(refVector(git)) ||
+      if (commonDir !== currentCommonDir() || digest(repositoryIncarnation) !== digest(fileIdentity(commonDir)) || digest(beforeRefs) !== digest(refVector(git)) ||
         digest(inventory) !== digest(worktreeInventory(git))) throw new Error('Repository inventory changed during content observation');
     } catch (error) { decisions = decisions.map(decision => ({ ...decision, status: 'analysis_failed', reasons: ['observation_unavailable'], error: error.message, evidence: null })); }
     return { version: 1, project: project.id, observedAt: now, policyGeneration: config.generation, applyEnabled: false, decisions: decisions.map(decision => ({ ...decision, id: digest({ policy: config.generation, ...decision }) })) };

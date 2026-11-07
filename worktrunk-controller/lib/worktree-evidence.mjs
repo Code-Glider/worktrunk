@@ -2,7 +2,7 @@ import { acceptanceMatchesLaunch, checkoutProducerFence, endedManagedLaunch, ina
 import { digest } from './data.mjs';
 import { currentGitHubOutcome } from './github-issues.mjs';
 
-const maxIssueAgeMs = 5 * 60_000;
+export const maxIssueAgeMs = 5 * 60_000;
 
 // This is the last successful GitHub observation. Mutation needs a fresh read
 // and must compare the authority revision again under its cleanup claim.
@@ -38,8 +38,8 @@ export function worktreeTaskEvidence(config, store, project, checkout, now) {
   return { ...observed, status: 'accepted', acceptanceId: latest.eventId, acceptedAt: latest.at };
 }
 
-export function worktreeProducerEvidence(store, project, checkout, nativeHost, claimToken) {
-  if (!inactive(store, checkout.path)) return { status: 'active_or_unresolved_claim' };
+export function worktreeProducerEvidence(store, project, checkout, nativeHost, claimToken, ownCleanupToken) {
+  if (!inactive(store, checkout.path, ownCleanupToken)) return { status: 'active_or_unresolved_claim' };
   if (project.producerAdmission !== 'cooperative-windows-job-v1') return { status: 'contract_unavailable' };
   if (!nativeHost) return { status: 'native_host_unavailable' };
   const launch = claimToken && store.get('claim', claimToken)?.value;
