@@ -75,7 +75,7 @@ export function loadConfig(filename) {
     nativeHost = { path: localPath(host.path), sha256: host.sha256, version: host.version };
   }
   if (nativeHost && artifactRoots.some(root => overlap(root.path, nativeHost.path))) throw new Error('Artifact root overlaps protected native host');
-  const sourceIds = new Set(), instances = new Set();
+  const sourceIds = new Set(), instances = new Set(), githubRepositories = new Set();
   if (value.eventSources !== undefined && !Array.isArray(value.eventSources)) throw new Error('eventSources must be an array');
   const eventSources = (value.eventSources ?? []).map(source => {
     object(source, 'event source');
@@ -84,7 +84,22 @@ export function loadConfig(filename) {
     sourceIds.add(id); instances.add(instance);
     if (!['host', 'task'].includes(source.role)) throw new Error('Unsupported event source role');
     if (!Array.isArray(source.projects) || !source.projects.length || source.projects.some(id => !ids.has(id)) || new Set(source.projects).size !== source.projects.length) throw new Error('Source projects must be registered and unique');
-    return { id, instance, role: source.role, projects: [...source.projects].sort(), authority: source.role === 'task' ? text(source.authority, 'source.authority') : null };
+    const binding = { id, instance, role: source.role, projects: [...source.projects].sort(), authority: null };
+    if (source.github === undefined) {
+      binding.authority = source.role === 'task' ? text(source.authority, 'source.authority') : null;
+      if (binding.authority === 'github.com/issues') throw new Error('Use a GitHub issue source for GitHub issue authority');
+      return binding;
+    }
+    const github = object(source.github, 'source.github');
+    if (source.role !== 'task' || source.projects.length !== 1 || source.authority !== undefined || Object.keys(github).some(key => !['repository', 'repositoryId', 'acceptorIds'].includes(key))) throw new Error('GitHub issue sources require one registered project and GitHub authority');
+    const repository = text(github.repository, 'GitHub repository');
+    if (repository !== repository.trim() || !/^[a-z\d][a-z\d-]*\/[a-z\d_.-]+$/i.test(repository) || ['/..', '/.'].some(suffix => repository.endsWith(suffix))) throw new Error('GitHub repository must use owner/name');
+    integer(github.repositoryId, 'GitHub repository ID', 1);
+    if (githubRepositories.has(github.repositoryId)) throw new Error('Duplicate GitHub repository source');
+    githubRepositories.add(github.repositoryId);
+    if (!Array.isArray(github.acceptorIds) || !github.acceptorIds.length || new Set(github.acceptorIds).size !== github.acceptorIds.length) throw new Error('GitHub issue sources require unique acceptor IDs');
+    const acceptorIds = github.acceptorIds.map(id => integer(id, 'GitHub acceptor ID', 1)).sort((a, b) => a - b);
+    return { ...binding, authority: 'github.com/issues', github: { repository: repository.toLowerCase(), repositoryId: github.repositoryId, acceptorIds } };
   });
   const normalized = { version: 1, host: { id: host.id, platform: host.platform }, worktrunk: { path: executable, sha256: wt.sha256, version: wt.version, schema: wt.schema }, nativeHost, projects, stateDir, quarantineDir, policy, limits, artifactRoots, eventSources };
   return { ...normalized, generation: digest(normalized), configPath: localPath(filename) };

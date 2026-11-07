@@ -1,4 +1,5 @@
 import { digest, integer, object, stable, text } from './data.mjs';
+import { fetchIssueEvents, githubGet } from './github-issues.mjs';
 
 const hostTypes = new Set(['session_started', 'working', 'waiting', 'session_ended', 'association']);
 const taskTypes = new Set(['task_started', 'attempt_started', 'attempt_accepted', 'attempt_failed', 'attempt_cancelled', 'task_reopened', 'task_revoked']);
@@ -9,6 +10,32 @@ const fields = new Set(['version', 'eventId', 'type', 'project', 'at', 'sequence
 export function ingest(config, store, sourceId, payload, observedAt = Date.now()) {
   const source = config.eventSources.find(source => source.id === sourceId);
   if (!source) throw new Error('Unconfigured event source');
+  if (source.github) throw new Error('Use sync-github-issue for a GitHub issue source');
+  return store.transaction(tx => recordEvent(tx, source, payload, observedAt));
+}
+
+export async function syncGitHubIssue(config, store, sourceId, issueNumber, request = githubGet) {
+  const source = config.eventSources.find(source => source.id === sourceId);
+  if (!source?.github) throw new Error('Select a configured GitHub issue source');
+  integer(issueNumber, 'GitHub issue number', 1);
+  const key = digest([source.instance, issueNumber]);
+  const revision = store.get('github_issue', key)?.revision;
+  const { taskId, authorityProject, events } = await fetchIssueEvents(source, issueNumber, config.limits.timeoutMs, request);
+  const observedAt = Date.now();
+  const taskKey = digest([source.authority, authorityProject, taskId]);
+  const acceptances = events.filter(event => event.type === 'attempt_accepted').map(event => event.eventId).sort();
+  return store.transaction(tx => {
+    const binding = tx.get('event_source', source.instance)?.value;
+    if (binding && digest(binding.source) !== digest(source)) throw new Error('Source binding changed; use a new instance');
+    if (tx.get('github_issue', key)?.revision !== revision) throw new Error('A concurrent GitHub issue sync superseded this read');
+    const results = events.map(event => recordEvent(tx, source, event, observedAt));
+    if (!binding && !events.length) tx.put('event_source', source.instance, { version: 1, source });
+    tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, taskKey, observedAt, acceptances });
+    return { version: 1, source: source.id, issue: issueNumber, taskId, recorded: results.filter(result => !result.replay).length, replayed: results.filter(result => result.replay).length };
+  });
+}
+
+function recordEvent(tx, source, payload, observedAt) {
   object(payload, 'event');
   if (payload.version !== 1) throw new Error('Unsupported event schema');
   if (Object.keys(payload).some(key => !fields.has(key)) || stable(payload).length > 65536) throw new Error('Unsupported/oversized event fields');
@@ -34,19 +61,17 @@ export function ingest(config, store, sourceId, payload, observedAt = Date.now()
   } else if (payload.fromSequence !== undefined || payload.throughSequence !== undefined) throw new Error('Sequence ranges require an independent checkpoint');
   integer(observedAt, 'observedAt');
   const id = digest([source.instance, event.eventId]);
-  return store.transaction(tx => {
-    const binding = tx.get('event_source', source.instance)?.value;
-    if (binding && digest(binding.source) !== digest(source)) throw new Error('Source binding changed; use a new instance');
-    const old = tx.get('event', id)?.value;
-    if (old) {
-      if (digest(old.event) !== digest(event)) throw new Error('Conflicting event replay');
-      return { version: 1, id, replay: true };
-    }
-    if (event.sequence !== null && tx.list('event').some(row => row.value.event.sourceInstance === source.instance && row.value.event.sequence === event.sequence)) throw new Error('Conflicting source sequence');
-    if (!binding) tx.put('event_source', source.instance, { version: 1, source });
-    tx.put('event', id, { version: 1, event, observedAt });
-    return { version: 1, id, replay: false };
-  });
+  const binding = tx.get('event_source', source.instance)?.value;
+  if (binding && digest(binding.source) !== digest(source)) throw new Error('Source binding changed; use a new instance');
+  const old = tx.get('event', id)?.value;
+  if (old) {
+    if (digest(old.event) !== digest(event)) throw new Error('Conflicting event replay');
+    return { version: 1, id, replay: true };
+  }
+  if (event.sequence !== null && tx.list('event').some(row => row.value.event.sourceInstance === source.instance && row.value.event.sequence === event.sequence)) throw new Error('Conflicting source sequence');
+  if (!binding) tx.put('event_source', source.instance, { version: 1, source });
+  tx.put('event', id, { version: 1, event, observedAt });
+  return { version: 1, id, replay: false };
 }
 
 export function sourceCoverage(source, events) {

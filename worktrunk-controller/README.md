@@ -142,7 +142,7 @@ This is a cooperative contract, not a sandbox: launch the actual native agent an
 
 ## Events and throughput
 
-Configure `eventSources` explicitly. Each source has an `id`, immutable `instance`, `role` (`host` or `task`) and a nonempty list of registered `projects`. Task sources also require an `authority` namespace. A changed source binding needs a new instance. Configuration grants ingestion authority; a host event cannot assert task acceptance. No real task tracker is selected or installed by this implementation.
+Configure `eventSources` explicitly. Each source has an `id`, immutable `instance`, `role` (`host` or `task`) and a nonempty list of registered `projects`. Task sources supply an `authority` namespace or a GitHub issue binding. A changed source binding needs a new instance. Only task sources can record acceptance.
 
 ```json
 {"id":"tracker","instance":"tracker-installation-1","role":"task","projects":["registered-project-id"],"authority":"chosen-task-tracker"}
@@ -154,6 +154,20 @@ Send one normalized version-1 JSON event on stdin. Required fields are `eventId`
 node worktrunk-controller/bin/controller.mjs ingest --config <absolute-config.json> --source tracker --format json
 node worktrunk-controller/bin/controller.mjs report --config <absolute-config.json> --from 2026-11-01 --to 2026-11-06 --format json
 ```
+
+For GitHub Issues, bind one registered project to a repository and list the numeric GitHub user IDs allowed to record acceptance. Use `gh api repos/OWNER/REPO --jq .id` for the repository ID and `gh api users/LOGIN --jq .id` for each reviewer ID.
+
+```json
+{"id":"github","instance":"github-issues-1","role":"task","projects":["registered-project-id"],"github":{"repository":"owner/repo","repositoryId":123,"acceptorIds":[456]}}
+```
+
+A configured reviewer posts one line on the issue in the form `/worktrunk accept ATTEMPT FULL_COMMIT_SHA`. `ATTEMPT` is a positive number and `FULL_COMMIT_SHA` is the full 40-character Git commit ID. The controller reads GitHub’s native reopen events. Closing an issue never records acceptance. To accept work after reopening, post a new acceptance comment with the reviewed attempt and commit.
+
+```console
+node worktrunk-controller/bin/controller.mjs sync-github-issue --config <absolute-config.json> --source github --issue 123 --format json
+```
+
+Sync uses the authenticated GitHub CLI to read the selected issue and writes normalized observations to controller state. It does not write to GitHub. The report shows the time of the last successful read. If a previously observed acceptance comment is edited or deleted, the next sync excludes it from current status and preserves the historical observation. This source covers acceptance and reopening. A complete first-attempt rate, duration and agent attribution require failure, cancellation, start and identity records. Sync cannot authorize worktree cleanup.
 
 The report's UTC end date is exclusive and cannot be in the future. Task event types are `task_started`, `attempt_started`, `attempt_accepted`, `attempt_failed`, `attempt_cancelled`, `task_reopened` and `task_revoked`. Host types are `session_started`, `working`, `waiting`, `session_ended` and `association`. Either source may send an independent `checkpoint` with `fromSequence`/`throughSequence` to expose gaps; checkpoints do not occupy an event sequence. Coverage remains partial and unmeasured even when a declared range is complete.
 

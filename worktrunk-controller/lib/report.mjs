@@ -14,7 +14,8 @@ function weekStart(at) {
   return date.toISOString().slice(0, 10);
 }
 
-function taskProjection(key, events, now) {
+function taskProjection(key, events, now, githubIssue) {
+  const isGitHub = events[0].authority === 'github.com/issues';
   const attempts = new Map();
   for (const event of events) if (event.attemptId) {
     const rows = attempts.get(event.attemptId) ?? [];
@@ -24,7 +25,8 @@ function taskProjection(key, events, now) {
     const numbers = new Set(rows.map(row => row.attemptNumber));
     const terminals = rows.filter(row => terminalTypes.has(row.type));
     const outcomes = new Set(terminals.map(row => terminalTypes.get(row.type)));
-    return { id, number: numbers.size === 1 ? rows[0].attemptNumber : null, startedAt: firstTime(rows.filter(row => row.type === 'attempt_started')), terminal: outcomes.size === 1 ? [...outcomes][0] : outcomes.size ? 'ambiguous' : null, terminalAt: firstTime(terminals) };
+    const conflictingHeads = isGitHub && new Set(terminals.map(row => row.head)).size > 1;
+    return { id, number: numbers.size === 1 ? rows[0].attemptNumber : null, startedAt: firstTime(rows.filter(row => row.type === 'attempt_started')), terminal: outcomes.size > 1 || conflictingHeads ? 'ambiguous' : ([...outcomes][0] ?? null), terminalAt: firstTime(terminals) };
   }).sort((a, b) => (a.number ?? Infinity) - (b.number ?? Infinity) || a.id.localeCompare(b.id));
   const accepted = events.filter(event => event.type === 'attempt_accepted');
   const firstAcceptedAt = firstTime(accepted);
@@ -32,18 +34,26 @@ function taskProjection(key, events, now) {
   const agents = new Set(acceptedRows.map(row => JSON.stringify(row.agentIds)));
   const agentIds = agents.size === 1 && acceptedRows.every(row => row.attemptId) ? acceptedRows[0].agentIds : [];
   const startedAt = firstTime(events.filter(event => event.type === 'task_started'));
-  const stateRows = events.filter(event => ['attempt_accepted', 'task_reopened', 'task_revoked'].includes(event.type)).sort(order);
+  const currentAcceptance = new Set(githubIssue?.acceptances);
+  const stateRows = events.filter(event => {
+    if (event.type === 'task_reopened' || event.type === 'task_revoked') return true;
+    return event.type === 'attempt_accepted' && (!isGitHub || (event.sourceInstance === githubIssue?.sourceInstance && currentAcceptance.has(event.eventId)));
+  }).sort(order);
   const latest = stateRows.at(-1);
   const ambiguousClock = events.some(event => event.at === null || event.at > now);
   const projectConflict = new Set(events.map(event => event.project)).size !== 1;
-  const hasAttemptConflict = projected.some(attempt => attempt.terminal === 'ambiguous');
+  const lastReopen = stateRows.findLast(event => event.type === 'task_reopened');
+  const hasCurrentConflict = isGitHub
+    ? latest?.type === 'attempt_accepted' && new Set(stateRows.filter(event => event.type === 'attempt_accepted' && event.attemptId === latest.attemptId && event.at >= (lastReopen?.at ?? 0)).map(event => event.head)).size > 1
+    : projected.some(attempt => attempt.terminal === 'ambiguous');
   const invalidOrdering = projected.some(attempt => attempt.startedAt !== null && attempt.terminalAt !== null && attempt.terminalAt < attempt.startedAt) || (startedAt !== null && firstAcceptedAt !== null && firstAcceptedAt < startedAt);
   const ordinalKnown = projected.length > 0 && projected.every(attempt => attempt.number !== null) && new Set(projected.map(attempt => attempt.number)).size === projected.length;
   const firstAttempt = ordinalKnown ? projected.find(attempt => attempt.number === 1) ?? null : null;
   const sameTimeConflict = latest && stateRows.some(event => event.at === latest.at && event.type !== latest.type);
   return {
     id: key, authority: events[0].authority, authorityProject: events[0].authorityProject, taskId: events[0].taskId, project: events[0].project,
-    startedAt, firstAcceptedAt, currentOutcome: ambiguousClock || projectConflict || hasAttemptConflict || sameTimeConflict || !latest ? 'unknown' : latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked',
+    ...(isGitHub ? { authorityObservedAt: githubIssue?.observedAt ?? null } : {}),
+    startedAt, firstAcceptedAt, currentOutcome: ambiguousClock || projectConflict || hasCurrentConflict || sameTimeConflict || !latest ? 'unknown' : latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked',
     agentIds, attribution: agentIds.length === 1 ? 'single_agent' : agentIds.length > 1 ? 'multiple_agents' : 'unavailable',
     durationMs: !ambiguousClock && !projectConflict && !invalidOrdering && startedAt !== null && firstAcceptedAt !== null ? firstAcceptedAt - startedAt : null,
     attempts: projected, observedAttempts: projected.length, observedRetries: projected.length ? projected.length - 1 : null,
@@ -112,7 +122,12 @@ export function report(config, store, { from, to, now = Date.now() }) {
       const rows = sessionGroups.get(key) ?? []; rows.push(event); sessionGroups.set(key, rows);
     }
   }
-  const tasks = [...taskGroups].map(([key, rows]) => taskProjection(key, rows, now)).sort((a, b) => a.id.localeCompare(b.id));
+  const githubSources = new Map(config.eventSources.filter(source => source.github).map(source => [source.instance, source]));
+  const githubIssues = new Map(store.list('github_issue').filter(row => {
+    const source = githubSources.get(row.value.sourceInstance);
+    return source && digest(store.get('event_source', source.instance)?.value.source ?? null) === digest(source) && row.value.observedAt <= now;
+  }).map(row => [row.value.taskKey, row.value]));
+  const tasks = [...taskGroups].map(([key, rows]) => taskProjection(key, rows, now, githubIssues.get(key))).sort((a, b) => a.id.localeCompare(b.id));
   const sessions = [...sessionGroups].map(([key, rows]) => sessionProjection(key, rows, allEvents.filter(event => event.sourceInstance === rows[0].sourceInstance && event.sequence !== null).map(event => event.sequence), from, to)).sort((a, b) => a.id.localeCompare(b.id));
   const cohorts = new Map();
   const acceptedTasks = tasks.filter(task => inWindow(task.firstAcceptedAt, from, to) && task.timingStatus !== 'unavailable');
