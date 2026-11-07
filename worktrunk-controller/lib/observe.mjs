@@ -7,6 +7,8 @@ import { fileIdentity, localPath, overlap } from './paths.mjs';
 import { invocation, refVector, worktreeInventory } from './invoke.mjs';
 import { inspectIdentity } from './identity.mjs';
 import { decideWorktree } from './policy.mjs';
+import { verifyNativeHost } from './native-host.mjs';
+import { worktreeProducerEvidence, worktreeTaskEvidence } from './worktree-evidence.mjs';
 
 const integrationReasons = new Set(['same_commit', 'ancestor', 'trees_match', 'no_added_changes', 'merge_adds_nothing', 'patch_id_match']);
 const codeRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -77,6 +79,13 @@ export function scanProject(config, store, project, now = Date.now()) {
   return invocation(config, project.root, ({ git, wt }) => {
     const inventory = worktreeInventory(git);
     const beforeRefs = refVector(git);
+    const commonDir = localPath(git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
+    const repositoryIncarnation = fileIdentity(commonDir);
+    let nativeHost = null;
+    if (project.producerAdmission && config.nativeHost && process.platform === 'win32') {
+      try { nativeHost = verifyNativeHost(config); }
+      catch { /* A failed pin check cannot qualify producer admission. */ }
+    }
     let envelope, failure;
     try {
       envelope = validateObservation(JSON.parse(wt(['list', '--format=json'])));
@@ -110,13 +119,22 @@ export function scanProject(config, store, project, now = Date.now()) {
         if (integration === null || (integration && !integrationReasons.has(integration.reason))) throw new Error('Unknown Worktrunk integration result');
         const gitDir = localPath(git(['rev-parse', '--absolute-git-dir'], root).trim());
         const identity = inspectIdentity(store, root, gitDir)?.value ?? null;
+        const incarnation = fileIdentity(root);
         const contents = inventoryContents(root, config.limits);
         const status = git(['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignored=matching', '--ignore-submodules=none'], root);
         const records = status.split('\0');
         // Git status deliberately hides assume-unchanged and skip-worktree content.
         const hiddenIndex = git(['ls-files', '-v', '-z'], root).split('\0').some(record => /^[a-zS] /.test(record));
+        const checkout = { path: root, head: entry.HEAD, identity: identity?.id, incarnation, repositoryIncarnation };
+        const gate = identity && !tree.main ? store.transaction(tx => {
+          if (inspectIdentity(tx, root, gitDir)?.value.id !== identity.id) throw new Error('Worktree enrollment changed during observation');
+          const task = worktreeTaskEvidence(config, tx, project, checkout, now);
+          const producer = worktreeProducerEvidence(tx, project, checkout, nativeHost, task.claimToken);
+          return { task, producer };
+        }) : null;
+        if (digest(incarnation) !== digest(fileIdentity(root))) throw new Error('Worktree incarnation changed during observation');
         evidence = {
-          incarnation: fileIdentity(root), gitDir, identity: identity?.id ?? null, enrolledAt: identity?.enrolledAt ?? null,
+          incarnation, gitDir, identity: identity?.id ?? null, enrolledAt: identity?.enrolledAt ?? null,
           main: tree.main, defaultBranch: item.branch === envelope.repo.default_branch, locked: Boolean(entry.locked || tree.locked), stale: false,
           protectedPath: [process.cwd(), codeRoot, config.stateDir, config.quarantineDir].some(protectedRoot => overlap(root, localPath(protectedRoot, { missing: true }))),
           integration: integration?.reason ?? null, refs: beforeRefs, targets: envelope.observation.targets,
@@ -124,13 +142,15 @@ export function scanProject(config, store, project, now = Date.now()) {
           dirty: hiddenIndex ? null : ['staged', 'modified', 'renamed', 'deleted', 'conflicted'].some(key => changes[key]) || records.some(record => /^[12u] /.test(record)),
           untracked: changes.untracked || records.some(record => record.startsWith('? ')), ignored: records.some(record => record.startsWith('! ')),
           operation: Boolean(tree.operation), nested: contents.nested, links: contents.links, contents,
-          acceptedTask: false, inactiveProducers: false,
+          acceptedTask: gate?.task.status === 'accepted', inactiveProducers: gate?.producer.status === 'inactive',
+          ...(gate ? { taskEvidence: gate.task, producerEvidence: gate.producer, repositoryIncarnation } : {}),
         };
         return { ...target, ...decideWorktree(evidence, config.policy, now), evidence };
       } catch (error) { return { ...target, status: 'analysis_failed', reasons: ['observation_unavailable'], error: error.message, evidence: null }; }
     });
     try {
-      if (digest(beforeRefs) !== digest(refVector(git)) || digest(inventory) !== digest(worktreeInventory(git))) throw new Error('Repository inventory changed during content observation');
+      if (digest(repositoryIncarnation) !== digest(fileIdentity(commonDir)) || digest(beforeRefs) !== digest(refVector(git)) ||
+        digest(inventory) !== digest(worktreeInventory(git))) throw new Error('Repository inventory changed during content observation');
     } catch (error) { decisions = decisions.map(decision => ({ ...decision, status: 'analysis_failed', reasons: ['observation_unavailable'], error: error.message, evidence: null })); }
     return { version: 1, project: project.id, observedAt: now, policyGeneration: config.generation, applyEnabled: false, decisions: decisions.map(decision => ({ ...decision, id: digest({ policy: config.generation, ...decision }) })) };
   });

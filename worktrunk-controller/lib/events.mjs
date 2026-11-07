@@ -20,6 +20,7 @@ export async function syncGitHubIssue(config, store, sourceId, issueNumber, requ
   integer(issueNumber, 'GitHub issue number', 1);
   const key = digest([source.instance, issueNumber]);
   const revision = store.get('github_issue', key)?.revision;
+  const readStartedAt = Date.now();
   const { taskId, authorityProject, events } = await fetchIssueEvents(source, issueNumber, config.limits.timeoutMs, request);
   const observedAt = Date.now();
   const taskKey = digest([source.authority, authorityProject, taskId]);
@@ -30,7 +31,7 @@ export async function syncGitHubIssue(config, store, sourceId, issueNumber, requ
     if (tx.get('github_issue', key)?.revision !== revision) throw new Error('A concurrent GitHub issue sync superseded this read');
     const results = events.map(event => recordEvent(tx, source, event, observedAt));
     if (!binding && !events.length) tx.put('event_source', source.instance, { version: 1, source });
-    tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, taskKey, observedAt, acceptances });
+    tx.put('github_issue', key, { version: 1, sourceInstance: source.instance, taskKey, readStartedAt, observedAt, acceptances });
     return { version: 1, source: source.id, issue: issueNumber, taskId, recorded: results.filter(result => !result.replay).length, replayed: results.filter(result => result.replay).length };
   });
 }

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { once } from 'node:events';
 import { Store } from '../lib/store.mjs';
-import { acquireCleanup, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
+import { acquireCleanup, checkoutProducerFence, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
 import { child, fixture } from './helpers.mjs';
 import { fileIdentity } from '../lib/paths.mjs';
 
@@ -90,6 +90,26 @@ test('issue-bound checkout exclusivity rejects moved active producer roots in ei
     assert.throws(() => second(other), /exclusive producer admission/);
     assert.deepEqual(s.store.list('claim').map(row => row.id), [first.token]);
   }
+});
+
+test('completed later producers invalidate the prior checkout fence, while unrelated roots do not', t => {
+  const s = setup(t), unrelated = path.join(s.base, 'other');
+  fs.mkdirSync(unrelated);
+  const complete = (root, task) => {
+    const claim = reserve(s.store, { roots: [root], owner: 'host', sessionId: 'agent', task });
+    const evidence = { kind: 'windows_job', launchToken: claim.token, helperPid: 1, activeProcesses: null };
+    transition(s.store, claim.token, 'reserved', 'starting');
+    transition(s.store, claim.token, 'starting', 'running', evidence);
+    return transition(s.store, claim.token, 'running', 'ended', { ...evidence, activeProcesses: 1 }, task ? 'a'.repeat(40) : undefined);
+  };
+  complete(s.root);
+  const bound = complete(s.root, { taskKey: 'issue', attempt: 1 });
+  const currentFence = () => checkoutProducerFence(s.store.list('claim').map(row => row.value), bound.roots[0], bound.token);
+  assert.equal(currentFence(), bound.priorProducerFence);
+  complete(unrelated);
+  assert.equal(currentFence(), bound.priorProducerFence);
+  complete(path.join(s.root, 'child'));
+  assert.notEqual(currentFence(), bound.priorProducerFence);
 });
 
 test('a moved child cleanup claim blocks admission to its new parent and unrelated unknown topology', t => {

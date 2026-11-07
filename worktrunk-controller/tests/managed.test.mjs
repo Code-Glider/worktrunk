@@ -8,11 +8,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../lib/store.mjs';
-import { acquireCleanup, inactive, releaseCleanup } from '../lib/admission.mjs';
+import { acquireCleanup, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
 import { enrollArtifact } from '../lib/artifacts.mjs';
 import { loadConfig } from '../lib/config.mjs';
+import { syncGitHubIssue } from '../lib/events.mjs';
 import { enroll } from '../lib/identity.mjs';
 import { runManaged } from '../lib/managed.mjs';
+import { scanProject } from '../lib/observe.mjs';
 import { report } from '../lib/report.mjs';
 import { controller, fixture, git, nativeWorktrunk } from './helpers.mjs';
 
@@ -221,9 +223,10 @@ test('managed CLI requires enrollment and a pinned host, preserves arguments and
   assert.equal(fs.readFileSync(sentinel, 'utf8'), '--literal argument א');
 });
 
-test('native managed launch binds one enrolled checkout and captures the final commit', { skip: process.platform !== 'win32' }, async t => {
+test('native managed launch and GitHub approval qualify only the unchanged linked worktree', { skip: process.platform !== 'win32', timeout: 60000 }, async t => {
   const s = controller(t, binary);
   const root = path.join(s.base, 'checkout'), ready = path.join(s.base, 'ready'), gate = path.join(s.base, 'gate');
+  git(s.root, 'config', 'worktrunk.default-branch', 'main');
   git(s.root, 'worktree', 'add', '-b', 'agent', root);
   const gitDir = git(root, 'rev-parse', '--absolute-git-dir');
   const initialHead = git(root, 'rev-parse', 'HEAD');
@@ -231,6 +234,12 @@ test('native managed launch binds one enrolled checkout and captures the final c
   value.nativeHost = { path: host, version: 1, sha256: createHash('sha256').update(fs.readFileSync(host)).digest('hex') };
   value.eventSources = [{ id: 'issues', instance: 'issues-1', role: 'task', projects: ['myproject'], github: { repository: 'owner/repo', repositoryId: 22, acceptorIds: [5] } }];
   fs.writeFileSync(s.filename, JSON.stringify(value));
+  const registry = JSON.parse(fs.readFileSync(value.registry, 'utf8'));
+  registry.projects[0].producerAdmission = 'unsupported';
+  fs.writeFileSync(value.registry, JSON.stringify(registry));
+  assert.throws(() => loadConfig(s.filename), /Unsupported worktree producer admission contract/);
+  registry.projects[0].producerAdmission = 'cooperative-windows-job-v1';
+  fs.writeFileSync(value.registry, JSON.stringify(registry));
   const config = loadConfig(s.filename);
   let store;
   store = new Store(path.join(fixture(t, () => store?.close()), 'state'));
@@ -282,11 +291,42 @@ test('native managed launch binds one enrolled checkout and captures the final c
   assert.equal(task.currentOutcome, 'unknown');
   assert.equal(task.attempts[0].managed.head, claim.endedHead);
   assert.equal(task.attempts[0].terminal, null);
+  git(s.root, 'merge', '--ff-only', 'agent');
+  const candidate = (project = config.projects[0], now = Date.now()) => {
+    const scan = scanProject(config, store, project, now);
+    assert.equal(scan.applyEnabled, false);
+    return scan.decisions.find(item => item.branch === 'refs/heads/agent');
+  };
+  const approvedAt = Math.ceil(claim.endedAt / 1000) * 1000;
+  await until(() => Date.now() >= approvedAt);
+  const timestamp = new Date(approvedAt).toISOString().replace('.000Z', 'Z');
+  response['repos/owner/repo/issues/7/timeline?per_page=100'] = [[{ event: 'commented', id: 90, user: { type: 'User', id: 5 }, created_at: timestamp, updated_at: timestamp, body: `/worktrunk accept 1 ${claim.endedHead}` }]];
+  await syncGitHubIssue(config, store, 'issues', 7, read);
+  const eligible = candidate();
+  assert.equal(eligible.status, 'eligible', JSON.stringify(eligible));
+  assert.equal(eligible.evidence.taskEvidence.acceptedAt, approvedAt);
+  assert.equal(eligible.evidence.producerEvidence.status, 'inactive');
+  assert.ok(candidate({ ...config.projects[0], producerAdmission: undefined }).reasons.includes('contract_unavailable'));
+  assert.ok(candidate(config.projects[0], eligible.evidence.taskEvidence.observedAt + 5 * 60_000 + 1).reasons.includes('issue_observation_stale'));
+  const protectedFile = path.join(root, 'protected.tmp');
+  fs.appendFileSync(path.join(s.gitDir, 'info', 'exclude'), '\nprotected.tmp\n');
+  fs.writeFileSync(protectedFile, 'unique agent data');
+  assert.ok(candidate().reasons.includes('ignored_content_unclassified'));
+  assert.equal(fs.readFileSync(protectedFile, 'utf8'), 'unique agent data');
+  fs.unlinkSync(protectedFile);
+  const later = reserve(store, { roots: [root], owner: config.host.id, sessionId: 'unbound-later' });
+  assert.ok(candidate().reasons.includes('active_or_unresolved_claim'));
+  const evidence = { kind: 'windows_job', launchToken: later.token, helperPid: 1, activeProcesses: null };
+  transition(store, later.token, 'reserved', 'starting');
+  transition(store, later.token, 'starting', 'running', evidence);
+  transition(store, later.token, 'running', 'ended', { ...evidence, activeProcesses: 1 });
+  assert.equal(git(root, 'rev-parse', 'HEAD'), claim.endedHead);
+  assert.ok(candidate().reasons.includes('checkout_producer_history_changed'));
   const marker = path.join(gitDir, 'worktrunk-controller-worktree.json');
   const changed = async endpoint => {
     if (endpoint.includes('/timeline?')) fs.renameSync(marker, `${marker}.replaced`);
     return read(endpoint);
   };
   await assert.rejects(runManaged(config, store, { ...launch, github: { ...launch.github, attempt: 2 } }, changed), /matching enrollment/);
-  assert.equal(store.list('claim').length, 1);
+  assert.equal(store.list('claim').length, 2);
 });

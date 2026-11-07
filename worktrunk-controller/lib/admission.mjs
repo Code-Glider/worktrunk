@@ -37,6 +37,26 @@ function conflicts(tx, targets, cleanup, ownToken) {
   }));
 }
 
+export function checkoutProducerFence(producers, checkout, exceptToken) {
+  return digest(producers.filter(claim => claim.token !== exceptToken && claim.roots.some(root =>
+    overlap(root.path, checkout.path) || digest(root.incarnation) === digest(checkout.incarnation)
+  )).map(claim => claim.token).sort());
+}
+
+export function endedManagedLaunch(claim, now) {
+  return claim.kind === 'producer' && claim.state === 'ended' && Boolean(claim.task) &&
+    claim.evidence?.kind === 'windows_job' && claim.evidence.launchToken === claim.token && claim.evidence.activeProcesses === 1 &&
+    /^[a-f0-9]{40}$/.test(claim.endedHead ?? '') && Number.isSafeInteger(claim.admittedAt) && Number.isSafeInteger(claim.endedAt) &&
+    claim.admittedAt >= 0 && claim.endedAt >= claim.admittedAt && claim.endedAt <= now;
+}
+
+export function acceptanceMatchesLaunch(event, claim) {
+  const task = claim.task;
+  return event.attemptId === String(task.attempt) && event.attemptNumber === task.attempt && event.sourceInstance === task.sourceInstance &&
+    event.project === task.project && event.authorityProject === task.authorityProject && event.taskId === task.taskId &&
+    event.head === claim.endedHead && event.at >= claim.endedAt;
+}
+
 export function reserve(store, request) {
   const targets = roots(request.roots), owner = text(request.owner, 'owner'), sessionId = text(request.sessionId, 'sessionId');
   return store.transaction(tx => {
@@ -44,6 +64,7 @@ export function reserve(store, request) {
     const task = request.task;
     const producers = tx.list('claim').map(row => row.value).filter(claim => claim.kind === 'producer');
     if (task && producers.some(claim => claim.task?.taskKey === task.taskKey && claim.task.attempt === task.attempt)) throw new Error('GitHub issue attempt already has a launch claim');
+    if (task && producers.some(claim => claim.task?.taskKey === task.taskKey && claim.task.attempt > task.attempt)) throw new Error('GitHub issue newer attempt already has a launch claim');
     if (producers.some(claim => {
       if (claim.state === 'ended') return false;
       try {
@@ -52,7 +73,11 @@ export function reserve(store, request) {
       } catch { return true; }
     })) throw new Error('A managed task requires exclusive producer admission for its checkout');
     const token = randomUUID();
-    const record = { version: 1, token, kind: 'producer', state: 'reserved', owner, sessionId, roots: targets, evidence: null, ...(task ? { task } : {}) };
+    const record = { version: 1, token, kind: 'producer', state: 'reserved', owner, sessionId, roots: targets, evidence: null };
+    if (task) {
+      record.task = task;
+      record.priorProducerFence = checkoutProducerFence(producers, targets[0]);
+    }
     tx.put('claim', token, record);
     return record;
   });

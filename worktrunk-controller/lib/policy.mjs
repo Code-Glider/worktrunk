@@ -17,8 +17,8 @@ export function decideWorktree(facts, policy, now) {
   if (facts.nested) reasons.push('nested_repository');
   if (facts.links) reasons.push('link_content');
   if (facts.operation) reasons.push('operation_in_progress');
-  if (!facts.acceptedTask) reasons.push('task_outcome_unavailable');
-  if (!facts.inactiveProducers) reasons.push('producer_admission_unavailable');
+  if (!facts.acceptedTask) reasons.push('task_outcome_unavailable', ...(facts.taskEvidence ? [facts.taskEvidence.status] : []));
+  if (!facts.inactiveProducers) reasons.push('producer_admission_unavailable', ...(facts.producerEvidence ? [facts.producerEvidence.status] : []));
   return { status: reasons.length ? 'retain' : 'eligible', reasons };
 }
 

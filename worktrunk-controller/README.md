@@ -31,7 +31,11 @@ node worktrunk-controller/bin/controller.mjs enroll --config <absolute-config.js
 
 `enroll` explicitly writes an incarnation marker in that checkout's Git administrative directory and records its native identity in SQLite. Scans never enroll or repair a marker. Recreating a checkout at the same path and HEAD cannot inherit enrollment. Unknown identities and enrollment conflicts retain the checkout.
 
-Each inventory item has a decision ID, status and reasons. Logical bytes describe checkout content; estimated physical savings remain unavailable. Ignored/untracked files, hidden index entries, links, nested repositories, user locks, primary/default checkouts, unknown age and protected paths veto eligibility. Assume-unchanged and skip-worktree flags make cleanliness unknown. Missing task authority and producer admission currently retain every otherwise clean candidate. A failed probe produces `analysis_failed`, keeps the data and makes the CLI exit nonzero.
+Each inventory item has a decision ID, status and reasons. Logical bytes describe checkout content. Physical savings remain unavailable. Ignored or untracked files, hidden index entries, links, nested repositories, user locks, primary or default checkouts, unknown age and protected paths veto eligibility. Assume-unchanged and skip-worktree flags make cleanliness unknown. A failed probe produces `analysis_failed`, keeps the data and makes the CLI exit nonzero.
+
+An enrolled checkout can qualify in a scan when its exact completed attempt and current commit match a recent explicit GitHub acceptance. Run `sync-github-issue` after the managed launch ends and the reviewer accepts its commit. Scans use the last successful read and retain the checkout when that read began more than five minutes ago. Reopening, a higher numbered attempt, or a later producer on the checkout can invalidate the evidence. JSON includes the issue observation time and the task and producer reasons.
+
+For checkout eligibility, the registry project must declare `"producerAdmission":"cooperative-windows-job-v1"` before launch. This asserts that all checkout writers use the native admission contract. The scan verifies the same pinned helper used by the completed launch and checks for active or unresolved claims. Older launches without recorded checkout claim history remain available for throughput. Eligibility is a preview. Worktree apply is disabled.
 
 ## Scan/report job example
 
@@ -169,7 +173,7 @@ node worktrunk-controller/bin/controller.mjs sync-github-issue --config <absolut
 
 Sync reads the selected issue through the authenticated GitHub CLI and stores normalized observations locally. The report shows the time of the last successful read. If a previously observed acceptance comment is edited or deleted, the next sync excludes it from current status and preserves the historical observation.
 
-To associate a managed launch with an issue, add `--source github --issue 123 --attempt 1` before the program argument separator. Optionally add `--agent <agent-id>` for throughput attribution. The launcher reads the issue and verifies the enrolled checkout before admitting the job. It reserves each issue and attempt number once. Use the next number for another launch, including after an interrupted launch. When the native job proves its processes have exited, the controller records the checkout's final commit.
+To associate a managed launch with an issue, add `--source github --issue 123 --attempt 1` before the program argument separator. Optionally add `--agent <agent-id>` for throughput attribution. The launcher reads the issue and verifies the enrolled checkout before admitting the job. Each launch for the issue requires a higher attempt number, including after an interrupted launch. When the native job proves its processes have exited, the controller records the checkout's final commit.
 
 The report attributes a first acceptance to an explicitly named agent only when the GitHub issue, attempt and commit match and the acceptance timestamp is at or after verified completion. It measures task duration from the admitted first attempt when that start and the accepted attempt are both observed. Command exit status does not establish task acceptance, failure or cancellation. GitHub coverage and first-attempt rates remain partial, and these records do not authorize worktree cleanup.
 

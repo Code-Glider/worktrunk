@@ -23,7 +23,8 @@ export function loadConfig(filename) {
     if (ids.has(id)) throw new Error(`Duplicate project: ${id}`);
     ids.add(id);
     const root = localPath(path.resolve(path.dirname(registryPath), text(project.root, 'project.root')));
-    return { id, root };
+    if (project.producerAdmission !== undefined && project.producerAdmission !== 'cooperative-windows-job-v1') throw new Error('Unsupported worktree producer admission contract');
+    return { id, root, ...(project.producerAdmission ? { producerAdmission: project.producerAdmission } : {}) };
   });
   const stateDir = localPath(value.stateDir, { missing: true });
   const quarantineDir = localPath(value.quarantineDir, { missing: true });

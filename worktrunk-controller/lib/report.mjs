@@ -1,5 +1,7 @@
 import { digest, integer } from './data.mjs';
 import { sourceCoverage } from './events.mjs';
+import { acceptanceMatchesLaunch, endedManagedLaunch } from './admission.mjs';
+import { currentGitHubOutcome } from './github-issues.mjs';
 
 const terminalTypes = new Map([['attempt_accepted', 'accepted'], ['attempt_failed', 'failed'], ['attempt_cancelled', 'cancelled']]);
 const order = (a, b) => (a.at ?? Infinity) - (b.at ?? Infinity) || (a.sequence ?? Infinity) - (b.sequence ?? Infinity) || a.eventId.localeCompare(b.eventId);
@@ -43,26 +45,18 @@ function taskProjection(key, events, now, githubIssue, launches) {
   const acceptedRows = accepted.filter(event => event.at === firstAcceptedAt);
   const agents = new Set(acceptedRows.map(row => JSON.stringify(row.agentIds)));
   const acceptedLaunch = launchByAttempt.get(acceptedRows[0]?.attemptId);
-  const matchedLaunch = acceptedLaunch && acceptedRows.every(row => row.attemptNumber === acceptedLaunch.task.attempt &&
-    row.sourceInstance === acceptedLaunch.task.sourceInstance && row.project === acceptedLaunch.task.project &&
-    row.head === acceptedLaunch.endedHead && row.at >= acceptedLaunch.endedAt);
+  const matchedLaunch = acceptedLaunch && acceptedRows.every(row => acceptanceMatchesLaunch(row, acceptedLaunch));
   const firstLaunch = launchByAttempt.get('1');
   const projectConflict = new Set([...events.map(event => event.project), ...launches.map(launch => launch.task.project)]).size !== 1;
   const agentIds = isGitHub
     ? matchedLaunch && !projectConflict && acceptedLaunch.task.agentId ? [acceptedLaunch.task.agentId] : []
     : agents.size === 1 && acceptedRows.every(row => row.attemptId) ? acceptedRows[0].agentIds : [];
   const startedAt = isGitHub ? firstLaunch?.admittedAt ?? null : firstTime(events.filter(event => event.type === 'task_started'));
-  const currentAcceptance = new Set(githubIssue?.acceptances);
-  const stateRows = events.filter(event => {
-    if (event.type === 'task_reopened' || event.type === 'task_revoked') return true;
-    return event.type === 'attempt_accepted' && (!isGitHub || (event.sourceInstance === githubIssue?.sourceInstance && currentAcceptance.has(event.eventId)));
-  }).sort(order);
-  const latest = stateRows.at(-1);
+  const githubOutcome = isGitHub ? currentGitHubOutcome(events, githubIssue, now) : null;
+  const stateRows = isGitHub ? [] : events.filter(event => ['task_reopened', 'task_revoked', 'attempt_accepted'].includes(event.type)).sort(order);
+  const latest = githubOutcome?.latest ?? stateRows.at(-1);
   const ambiguousClock = events.some(event => event.at === null || event.at > now);
-  const lastReopen = stateRows.findLast(event => event.type === 'task_reopened');
-  const hasCurrentConflict = isGitHub
-    ? latest?.type === 'attempt_accepted' && new Set(stateRows.filter(event => event.type === 'attempt_accepted' && event.attemptId === latest.attemptId && event.at >= (lastReopen?.at ?? 0)).map(event => event.head)).size > 1
-    : projected.some(attempt => attempt.terminal === 'ambiguous');
+  const hasCurrentConflict = !isGitHub && projected.some(attempt => attempt.terminal === 'ambiguous');
   const invalidOrdering = projected.some(attempt => attempt.startedAt !== null && attempt.terminalAt !== null && attempt.terminalAt < attempt.startedAt) || (startedAt !== null && firstAcceptedAt !== null && firstAcceptedAt < startedAt);
   const ordinalKnown = projected.length > 0 && projected.every(attempt => attempt.number !== null) && new Set(projected.map(attempt => attempt.number)).size === projected.length;
   const firstAttempt = ordinalKnown ? projected.find(attempt => attempt.number === 1) ?? null : null;
@@ -70,7 +64,7 @@ function taskProjection(key, events, now, githubIssue, launches) {
   return {
     id: key, authority: task.authority, authorityProject: task.authorityProject, taskId: task.taskId, project: task.project,
     ...(isGitHub ? { authorityObservedAt: githubIssue?.observedAt ?? null } : {}),
-    startedAt, firstAcceptedAt, currentOutcome: ambiguousClock || projectConflict || hasCurrentConflict || sameTimeConflict || !latest ? 'unknown' : latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked',
+    startedAt, firstAcceptedAt, currentOutcome: ambiguousClock || projectConflict || hasCurrentConflict || sameTimeConflict || !latest ? 'unknown' : githubOutcome?.status ?? (latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked'),
     agentIds, attribution: agentIds.length === 1 ? 'single_agent' : agentIds.length > 1 ? 'multiple_agents' : 'unavailable',
     durationMs: !ambiguousClock && !projectConflict && !invalidOrdering && startedAt !== null && firstAcceptedAt !== null &&
       (!isGitHub || (matchedLaunch && firstLaunch.task.sourceInstance === acceptedLaunch.task.sourceInstance && startedAt <= acceptedLaunch.admittedAt))
@@ -149,10 +143,7 @@ export function report(config, store, { from, to, now = Date.now() }) {
   const launches = new Map();
   for (const { value } of store.list('claim')) {
     const task = value.task;
-    if (value.kind !== 'producer' || value.state !== 'ended' || !task || !registered.has(task.project) ||
-      value.evidence?.kind !== 'windows_job' || value.evidence.launchToken !== value.token || value.evidence.activeProcesses !== 1 ||
-      !/^[a-f0-9]{40}$/.test(value.endedHead ?? '') || !Number.isSafeInteger(value.admittedAt) || !Number.isSafeInteger(value.endedAt) ||
-      value.admittedAt < 0 || value.endedAt < value.admittedAt || value.endedAt > now) continue;
+    if (!endedManagedLaunch(value, now) || !registered.has(task.project)) continue;
     const rows = launches.get(task.taskKey) ?? [];
     rows.push(value); launches.set(task.taskKey, rows);
     if (!taskGroups.has(task.taskKey)) taskGroups.set(task.taskKey, []);

@@ -40,7 +40,7 @@ export async function runManaged(config, store, { root, projectId, sessionId, pr
     const checkout = managedCheckout(config, store, project, root);
     const { issue, taskId } = await syncGitHubIssue(config, store, source.id, github.issue, request);
     const authorityProject = String(source.github.repositoryId);
-    task = { taskKey: digest([source.authority, authorityProject, taskId]), sourceInstance: source.instance, project: projectId, issue, taskId, authorityProject, attempt, agentId, worktreeId: checkout.worktreeId, repositoryIncarnation: checkout.repositoryIncarnation };
+    task = { taskKey: digest([source.authority, authorityProject, taskId]), sourceInstance: source.instance, project: projectId, issue, taskId, authorityProject, attempt, agentId, worktreeId: checkout.worktreeId, repositoryIncarnation: checkout.repositoryIncarnation, producerAdmission: project.producerAdmission ?? null, nativeHost: host };
   }
   const checkTaskCheckout = readHead => {
     if (loadConfig(config.configPath).generation !== config.generation) throw new Error('Managed task configuration changed during launch');

@@ -50,3 +50,21 @@ export async function fetchIssueEvents(source, issueNumber, timeout, request) {
   }
   return { taskId, authorityProject, events };
 }
+
+export function currentGitHubOutcome(events, snapshot, now) {
+  const acceptanceIds = new Set(snapshot?.acceptances);
+  const acceptances = events.filter(event => event.type === 'attempt_accepted' &&
+    event.sourceInstance === snapshot?.sourceInstance && acceptanceIds.has(event.eventId));
+  const reopens = events.filter(event => event.type === 'task_reopened');
+  const latestFirst = (a, b) => b.at - a.at || a.eventId.localeCompare(b.eventId);
+  const accepted = acceptances.sort(latestFirst)[0], reopened = reopens.sort(latestFirst)[0];
+  const latest = [accepted, reopened].filter(Boolean).sort(latestFirst)[0] ?? null;
+  if (!latest || acceptances.length !== acceptanceIds.size ||
+    [...acceptances, ...reopens].some(event => !Number.isSafeInteger(event.at) || event.at < 0 || event.at > now) ||
+    acceptances.some(event => event.at > snapshot.observedAt)) return { status: 'unknown', latest };
+  if (!accepted || (reopened && reopened.at > accepted.at)) return { status: 'reopened', latest };
+  const conflicting = acceptances.some(event =>
+    (event.at === accepted.at && (event.attemptId !== accepted.attemptId || event.head !== accepted.head)) ||
+    (event.at >= (reopened?.at ?? 0) && event.attemptId === accepted.attemptId && event.head !== accepted.head));
+  return { status: reopened?.at === accepted.at || conflicting ? 'unknown' : 'accepted', latest };
+}

@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { digest } from '../lib/data.mjs';
+import { checkoutProducerFence, reserve } from '../lib/admission.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { ingest, syncGitHubIssue } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
 import { Store } from '../lib/store.mjs';
+import { fileIdentity } from '../lib/paths.mjs';
+import { worktreeTaskEvidence } from '../lib/worktree-evidence.mjs';
 import { controller, fixture } from './helpers.mjs';
 
 const head = 'a'.repeat(40);
@@ -141,6 +144,40 @@ test('throughput uses only matching ended launches and keeps GitHub authoritativ
   await sync([[retry, reopened]]);
   assert.equal(read().tasks[0].currentOutcome, 'reopened');
   assert.equal(read().worktreeApplyEnabled, false);
+});
+
+test('worktree task evidence follows current exact acceptance, reopening and newer attempts', async t => {
+  const { config, store, sync } = setup(t);
+  const project = config.projects[0], token = 'completed-launch';
+  const checkout = { path: project.root, identity: 'checkout-1', head, incarnation: fileIdentity(project.root), repositoryIncarnation: fileIdentity(path.join(project.root, '.git')) };
+  const task = { taskKey: digest(['github.com/issues', '22', '38']), sourceInstance: source.instance, project: project.id, issue: 7, taskId: '38', authorityProject: '22', attempt: 1, worktreeId: checkout.identity, repositoryIncarnation: checkout.repositoryIncarnation };
+  const launch = { version: 1, token, kind: 'producer', state: 'ended', owner: config.host.id, task, roots: [{ path: checkout.path, incarnation: checkout.incarnation }], admittedAt: Date.parse(start) - 2000, endedAt: Date.parse(start) - 1000, endedHead: head, evidence: { kind: 'windows_job', launchToken: token, activeProcesses: 1 } };
+  const read = (facts = checkout) => worktreeTaskEvidence(config, store, project, facts, Date.now()).status;
+  const save = value => store.transaction(tx => tx.put('claim', token, value));
+  await sync([[comment]]);
+  save(launch);
+  assert.equal(read(), 'checkout_producer_history_changed');
+  save({ ...launch, priorProducerFence: checkoutProducerFence([], checkout) });
+  assert.equal(read(), 'accepted');
+  assert.equal(read({ ...checkout, head: 'b'.repeat(40) }), 'checkout_head_changed');
+  assert.equal(read({ ...checkout, incarnation: { ...checkout.incarnation, ino: '-1' } }), 'completed_launch_unavailable');
+  assert.equal(read({ ...checkout, repositoryIncarnation: { ...checkout.repositoryIncarnation, ino: '-1' } }), 'completed_launch_unavailable');
+  const conflicting = { ...comment, id: 45, body: `/worktrunk accept 1 ${'b'.repeat(40)}` };
+  await sync([[conflicting]]);
+  assert.equal(read(), 'issue_acceptance_mismatch');
+  await sync([[comment, conflicting]]);
+  assert.equal(read(), 'issue_outcome_unavailable');
+  await sync([[{ ...comment, updated_at: reopened.created_at }]]);
+  assert.equal(read(), 'issue_outcome_unavailable');
+  await sync([[comment, reopened]]);
+  assert.equal(read(), 'issue_reopened');
+  const againAt = '2026-01-02T03:00:00Z';
+  const again = { ...comment, id: 46, created_at: againAt, updated_at: againAt };
+  await sync([[comment, reopened, again]]);
+  assert.equal(read(), 'accepted');
+  reserve(store, { roots: [fixture(t)], owner: config.host.id, sessionId: 'retry', task: { ...task, attempt: 3 } });
+  assert.equal(read(), 'newer_issue_attempt');
+  assert.throws(() => reserve(store, { roots: [fixture(t)], owner: config.host.id, sessionId: 'older', task: { ...task, attempt: 2 } }), /newer attempt already has a launch claim/);
 });
 
 test('wrong repository, pull request, malformed pages and conflicting replay leave evidence intact', async t => {
