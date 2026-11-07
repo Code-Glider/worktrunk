@@ -251,10 +251,6 @@ gix-url = "0.40"
 regex = "1.12.3"
 ignore = "0.4"
 reflink-copy = "0.1"
-# Atomic, no-overwrite rename (renameat2 / renamex_np / MoveFileExW) for
-# `--clobber` backups — closes the check-then-rename TOCTOU. Keeps the FFI
-# (and its `unsafe`) out of this crate.
-renamore = "0.3"
 dashmap = "6.2.1"
 fs2 = "0.4.3"
 sanitize-filename = "0.6.0"
@@ -344,6 +340,10 @@ signal-hook = "0.4.1"
 # Safe FIONREAD snapshots bound cancellation drains even with continuous writers;
 # directory-relative `*at` calls let tree removal never follow a symlink.
 rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(not(all(target_os = "linux", target_env = "musl")))'.dependencies]
+# Atomic no-overwrite clobber backups. Linux musl uses rustix's syscall instead.
+renamore = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # The localized Documents folder that holds PowerShell profiles.
