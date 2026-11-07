@@ -10,7 +10,7 @@ function roots(paths) {
 }
 
 export function holdsWorktreeRepository(action) {
-  return action.kind === 'worktree' && ['intent', 'prepared', 'moving', 'moved', 'locking', 'unlocking', 'unlocked', 'restoring'].includes(action.phase);
+  return action.kind === 'worktree' && ['intent', 'prepared', 'moving', 'moved', 'locking', 'purge_pending', 'unlocking', 'unlocked', 'restoring', 'purging'].includes(action.phase);
 }
 
 function fences(tx, claim, root) {
@@ -33,7 +33,7 @@ function fences(tx, claim, root) {
     if (action.containerIdentity) {
       if (digest(fileIdentity(containerPath)) !== digest(action.containerIdentity)) throw new Error('Cleanup container changed');
     } else if (fs.existsSync(containerPath)) throw new Error('Cleanup container is unverified');
-    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['moved', 'locking', 'quarantined', 'unlocking', 'unlocked', 'restoring', 'purging'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
+    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['moved', 'locking', 'quarantined', 'purge_pending', 'unlocking', 'unlocked', 'restoring', 'purging'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
   } else if (root.currentPath) throw new Error('Cleanup relocation has no action');
   if (digest(fileIdentity(root.currentPath ?? root.path)) !== digest(root.incarnation)) throw new Error('Claim incarnation changed');
   return result;
@@ -152,7 +152,7 @@ export function inactive(store, root, ownCleanupToken) {
   if (ownCleanupToken !== undefined) {
     const claim = store.get('claim', ownCleanupToken)?.value;
     const action = claim?.actionId && store.get('action', claim.actionId)?.value;
-    if (!claim || claim.kind !== 'cleanup' || claim.state !== 'held' || claim.roots.length !== 1 || (claim.roots[0].currentPath ?? claim.roots[0].path) !== targets[0].path || !action || !(claim.roots[0].currentPath ? ['quarantined', 'purging'] : ['intent', 'prepared']).includes(action.phase)) throw new Error('Own cleanup claim does not match action');
+    if (!claim || claim.kind !== 'cleanup' || claim.state !== 'held' || claim.roots.length !== 1 || (claim.roots[0].currentPath ?? claim.roots[0].path) !== targets[0].path || !action || !(claim.roots[0].currentPath ? ['quarantined', 'purge_pending', 'unlocked', 'purging'] : ['intent', 'prepared']).includes(action.phase)) throw new Error('Own cleanup claim does not match action');
     fences(store, claim, claim.roots[0]);
   }
   return !conflicts(store, targets, true, ownCleanupToken);

@@ -75,7 +75,8 @@ export function validateObservation(value) {
   return value;
 }
 
-export function scanProject(config, store, project, now = Date.now(), action) {
+export function scanProject(config, store, project, now = Date.now(), action, quarantine) {
+  if (quarantine && !action) throw new Error('Quarantine observation requires an owned action');
   if (action && !store.writing) throw new Error('Worktree action observation requires a write transaction');
   return invocation(config, project.root, ({ git, wt }) => {
     const inventory = worktreeInventory(git);
@@ -102,7 +103,8 @@ export function scanProject(config, store, project, now = Date.now(), action) {
         items.set(key, item);
       }
     } catch (error) { failure = error.message; }
-    const selectedInventory = action ? inventory.filter(entry => path.relative(entry.path, action.originalPath) === '') : inventory;
+    const selectedPath = quarantine ? action.payloadPath : action?.originalPath;
+    const selectedInventory = selectedPath ? inventory.filter(entry => path.relative(entry.path, selectedPath) === '') : inventory;
     let decisions = selectedInventory.map(entry => {
       const target = { kind: 'worktree', project: project.id, path: entry.path, branch: entry.branch ?? null, head: entry.HEAD ?? null };
       let evidence;
@@ -131,17 +133,23 @@ export function scanProject(config, store, project, now = Date.now(), action) {
         const checkout = { path: root, head: entry.HEAD, identity: identity?.id, incarnation, repositoryIncarnation };
         const readGate = tx => {
           if (inspectIdentity(tx, root, gitDir)?.value.id !== identity.id) throw new Error('Worktree enrollment changed during observation');
-          const task = worktreeTaskEvidence(config, tx, project, checkout, now);
+          // The launch is bound to the path at admission, before the controller moved the checkout.
+          const task = worktreeTaskEvidence(config, tx, project, quarantine ? { ...checkout, path: action.originalPath } : checkout, now);
           const producer = worktreeProducerEvidence(tx, project, checkout, nativeHost, task.claimToken, action?.claimToken);
           return { task, producer };
         };
         const gate = identity && !tree.main ? (action ? readGate(store) : store.transaction(readGate)) : null;
         if (digest(incarnation) !== digest(fileIdentity(root))) throw new Error('Worktree incarnation changed during observation');
+        const ownLock = quarantine?.lockReason && entry.locked === quarantine.lockReason && tree.locked?.reason === quarantine.lockReason;
         evidence = {
           incarnation, gitDir, identity: identity?.id ?? null, enrolledAt: identity?.enrolledAt ?? null,
-          main: tree.main, defaultBranch: item.branch === envelope.repo.default_branch, locked: Boolean(entry.locked || tree.locked), stale: false,
+          main: tree.main, defaultBranch: item.branch === envelope.repo.default_branch, locked: !ownLock && Boolean(entry.locked || tree.locked), stale: false,
           protectedPath: [process.cwd(), codeRoot, config.stateDir, config.quarantineDir, config.configPath, config.registryPath, config.worktrunk.path, config.nativeHost?.path,
-            ...config.projects.map(project => project.root), ...config.artifactRoots.map(artifact => artifact.path)].filter(Boolean).some(protectedRoot => overlap(root, localPath(protectedRoot, { missing: true }))),
+            ...config.projects.map(project => project.root), ...config.artifactRoots.map(artifact => artifact.path)].filter(Boolean).some(protectedRoot => {
+            const protectedPath = localPath(protectedRoot, { missing: true });
+            return quarantine ? overlap(action.originalPath, protectedPath) ||
+              (protectedRoot !== config.quarantineDir && overlap(root, protectedPath)) : overlap(root, protectedPath);
+          }),
           integration: integration?.reason ?? null, refs: beforeRefs, targets: envelope.observation.targets,
           hiddenIndex,
           dirty: hiddenIndex ? null : ['staged', 'modified', 'renamed', 'deleted', 'conflicted'].some(key => changes[key]) || records.some(record => /^[12u] /.test(record)),
