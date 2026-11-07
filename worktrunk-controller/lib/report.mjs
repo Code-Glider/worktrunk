@@ -218,7 +218,20 @@ export function report(config, store, { from, to, now = Date.now() }) {
     acceptedTaskDuration: { samples: durations.length, unavailable: acceptedTasks.length - durations.length, medianMs: durations.length ? (durations[Math.floor((durations.length - 1) / 2)] + durations[Math.floor(durations.length / 2)]) / 2 : null, p95Ms: quantile(durations, 0.95) },
     observedReopens: events.filter(event => event.type === 'task_reopened' && inWindow(event.at, from, to)).length,
     observedRevocations: events.filter(event => event.type === 'task_revoked' && inWindow(event.at, from, to)).length,
-    backlog: scans.map(scan => ({ project: scan.project, observedAt: scan.observedAt ?? null, policyCurrent: scan.policyGeneration === config.generation, worktrees: scan.decisions.length, retained: scan.decisions.filter(item => item.status === 'retain').length, analysisFailed: scan.decisions.filter(item => item.status === 'analysis_failed').length, reasons: scan.decisions.flatMap(item => item.reasons) })),
+    backlog: scans.map(scan => {
+      const failed = scan.status === 'analysis_failed';
+      const decisions = failed ? null : scan.decisions;
+      return {
+        project: scan.project, observedAt: scan.observedAt ?? null, policyCurrent: scan.policyGeneration === config.generation,
+        status: failed ? 'analysis_failed' : 'observed', ...(failed ? { error: scan.error } : {}),
+        worktrees: decisions?.length ?? null,
+        eligible: decisions?.filter(item => item.status === 'eligible').length ?? null,
+        retained: decisions?.filter(item => item.status === 'retain').length ?? null,
+        analysisFailed: decisions?.filter(item => item.status === 'analysis_failed').length ?? null,
+        staleRegistrations: decisions?.filter(item => item.reasons.includes('stale_registration_report_only')).length ?? null,
+        reasons: decisions?.flatMap(item => item.reasons) ?? [],
+      };
+    }),
     artifacts, artifactGrowthBytes: artifacts.length && artifacts.every(root => root.growthBytes !== null) ? artifacts.reduce((total, root) => total + root.growthBytes, 0) : null, reclaimedBytes: null, usage: null,
     tasks, sessions, concurrency,
   };

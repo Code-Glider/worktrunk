@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { Store } from '../lib/store.mjs';
 import { ingest } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
-import { fixture } from './helpers.mjs';
+import { controller, fixture } from './helpers.mjs';
 
 const sources = [
   { id: 'host', instance: 'host-1', role: 'host', projects: ['p', 'q'], authority: null },
@@ -25,6 +26,35 @@ function timeline(t) {
   const read = () => report(config, store, { from: base, to: base + 14 * day, now: base + 14 * day });
   return { store, add, read };
 }
+
+test('worktree backlog distinguishes an unavailable inventory from observed worktrees in JSON and text', t => {
+  const s = controller(t, process.execPath);
+  const writeScan = scan => {
+    const store = new Store(s.state);
+    try { store.transaction(tx => tx.put('scan', 'myproject', { version: 1, project: 'myproject', ...scan })); }
+    finally { store.close(); }
+  };
+  const cli = path.resolve(import.meta.dirname, '../bin/controller.mjs');
+  const invoke = format => {
+    const result = spawnSync(process.execPath, [cli, 'report', '--config', s.filename, '--from', '1970-01-01', '--to', '2000-01-01', '--format', format], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  writeScan({ observedAt: base, policyGeneration: s.config.generation, decisions: [
+    { status: 'eligible', reasons: [] },
+    { status: 'retain', reasons: ['stale_registration_report_only'] },
+    { status: 'analysis_failed', reasons: ['observation_unavailable'] },
+  ] });
+  assert.deepEqual(JSON.parse(invoke('json')).backlog, [{ project: 'myproject', observedAt: base, policyCurrent: true, status: 'observed', worktrees: 3, eligible: 1, retained: 1, analysisFailed: 1, staleRegistrations: 1, reasons: ['stale_registration_report_only', 'observation_unavailable'] }]);
+  assert.match(invoke('text'), /Worktree backlog for myproject: 3 observed; 1 eligible; 1 retained; 1 analysis failed; 1 stale registration/);
+
+  writeScan({ status: 'analysis_failed', error: 'Git inventory unavailable', decisions: [] });
+  const [failed] = JSON.parse(invoke('json')).backlog;
+  assert.equal(failed.status, 'analysis_failed');
+  assert.equal(failed.error, 'Git inventory unavailable');
+  for (const field of ['worktrees', 'eligible', 'retained', 'analysisFailed', 'staleRegistrations']) assert.equal(failed[field], null);
+  assert.match(invoke('text'), /Worktree backlog for myproject: unavailable \(Git inventory unavailable\)/);
+});
 
 test('weekly distinct tasks, first-attempt cancellations, retries and accepted cohort durations are exact after replay', t => {
   const { store, add, read } = timeline(t);
