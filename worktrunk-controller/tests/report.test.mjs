@@ -159,9 +159,11 @@ test('purge report counts completed owned actions once in the exact window witho
   put('before', { purgedAt: base - 1 }); put('end', { purgedAt: base + day });
   put('other-owner', { owner: 'other' }); put('other-project', { projects: ['q'] });
   put('pending', { phase: 'purging' }); put('interrupted', { phase: 'restored', purgeOutcome: 'interrupted' });
-  put('worktree', { kind: 'worktree' });
+  put('worktree', { kind: 'worktree', project: 'p' });
+  put('other-worktree', { kind: 'worktree', project: 'q' });
   const read = () => report(scoped, store, { from: base, to: base + day, now: base + 2 * day });
   const evidence = store.list('action');
+  assert.deepEqual(read().actions.filter(action => action.kind === 'worktree').map(action => [action.id, action.project]), [['worktree', 'p']]);
   assert.deepEqual(read().artifactPurges, { observedActions: 2, logicalBytes: 14, unavailableTimeActions: 0 });
   assert.deepEqual(read().artifactPurges, read().artifactPurges);
   assert.deepEqual(store.list('action'), evidence);

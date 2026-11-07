@@ -2,7 +2,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { parseArgs } from 'node:util';
-import { loadConfig } from '../lib/config.mjs';
+import { loadConfig, worktreeApplyEnabled } from '../lib/config.mjs';
 import { Store } from '../lib/store.mjs';
 import { invocation } from '../lib/invoke.mjs';
 import { enroll } from '../lib/identity.mjs';
@@ -12,7 +12,8 @@ import { ingest, syncGitHubIssue } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
 import { managedCheckout, runManaged } from '../lib/managed.mjs';
 import { enrollArtifact, inspectArtifact } from '../lib/artifacts.mjs';
-import { quarantineArtifact, restore, reconcile, inspectQuarantine, purgeArtifact } from '../lib/actions.mjs';
+import { quarantineArtifact, restore, reconcile, inspectQuarantine, purgeArtifact,
+  moveWorktreeToQuarantine, lockWorktreeQuarantine, restoreWorktree, inspectWorktreeQuarantine, purgeWorktree } from '../lib/actions.mjs';
 
 function readEvent() {
   const chunks = [], buffer = Buffer.alloc(4096);
@@ -57,10 +58,17 @@ try {
   const store = new Store(config.stateDir, { readOnly: command === 'report' });
   try {
     let output;
+    const decisionKind = values.decision && store.get('decision', values.decision)?.value.kind;
+    const actionKind = values.action && store.get('action', values.action)?.value.kind;
     if (command === 'ingest') output = ingest(config, store, values.source, readEvent());
     else if (command === 'sync-github-issue') output = await syncGitHubIssue(config, store, values.source, Number(values.issue));
-    else if (command === 'apply') output = quarantineArtifact(config, store, values.decision);
+    else if (command === 'apply' && decisionKind === 'worktree') {
+      const moved = await moveWorktreeToQuarantine(config, store, values.decision);
+      output = await lockWorktreeQuarantine(config, store, moved.id);
+    } else if (command === 'apply') output = quarantineArtifact(config, store, values.decision);
+    else if (command === 'purge' && decisionKind === 'worktree_purge') output = await purgeWorktree(config, store, values.decision);
     else if (command === 'purge') output = purgeArtifact(config, store, values.decision);
+    else if (command === 'restore' && actionKind === 'worktree') output = await restoreWorktree(config, store, values.action);
     else if (command === 'restore') output = restore(config, store, values.action);
     else if (command === 'reconcile') output = reconcile(config, store, values.action);
     else if (command === 'report') output = report({ ...config, projects }, store, window);
@@ -83,12 +91,14 @@ try {
         return enroll(store, root, git(['rev-parse', '--absolute-git-dir'], root).trim());
       });
     } else if (command === 'scan' && values.action) {
-      const decision = inspectQuarantine(config, store, values.action);
-      output = { version: 1, projects: [], artifacts: [decision] };
+      const worktree = actionKind === 'worktree';
+      const decision = worktree ? inspectWorktreeQuarantine(config, store, values.action) : inspectQuarantine(config, store, values.action);
+      output = worktree ? { version: 1, worktreeApplyEnabled: worktreeApplyEnabled(config, projects.filter(project => project.id === decision.project)),
+        projects: [{ project: decision.project, decisions: [decision] }], artifacts: [] } : { version: 1, projects: [], artifacts: [decision] };
       if (decision.status === 'analysis_failed') process.exitCode = 1;
       store.transaction(tx => tx.put('decision', decision.id, { version: 1, ...decision, policyGeneration: config.generation }));
     } else {
-      output = { version: 1, applyEnabled: config.policy.allowApply && process.platform === 'win32' && Boolean(config.nativeHost), worktreeApplyEnabled: false, projects: projects.map(project => {
+      output = { version: 1, applyEnabled: config.policy.allowApply && process.platform === 'win32' && Boolean(config.nativeHost), worktreeApplyEnabled: worktreeApplyEnabled(config, projects), projects: projects.map(project => {
         try { return scanProject(config, store, project); }
         catch (error) { process.exitCode = 1; return { version: 1, project: project.id, status: 'analysis_failed', error: error.message, decisions: [] }; }
       }) };
@@ -121,14 +131,19 @@ try {
       process.stdout.write(`Accepted task duration: median ${output.acceptedTaskDuration.medianMs ?? 'unavailable'} ms; p95 ${output.acceptedTaskDuration.p95Ms ?? 'unavailable'} ms; samples ${output.acceptedTaskDuration.samples}\n`);
       for (const artifact of output.artifacts) process.stdout.write(`  Artifact ${artifact.artifactId}: ${artifact.logicalBytes ?? 'unavailable'} logical bytes; observed growth ${artifact.growthBytes ?? 'unavailable'} bytes\n`);
       process.stdout.write(`Artifact purges: ${output.artifactPurges.observedActions} actions; ${output.artifactPurges.logicalBytes ?? 'unavailable'} logical bytes; ${output.artifactPurges.unavailableTimeActions} actions with unavailable time\n`);
-      for (const action of output.actions) process.stdout.write(`  Action ${action.id}: ${action.phase}${action.purgeOutcome === 'interrupted' ? '; interrupted purge, remaining contents only' : ''}${action.error ? ` (${action.error})` : ''}\n`);
+      for (const action of output.actions) process.stdout.write(`  ${action.kind === 'worktree' ? `Worktree action ${action.id} (${action.project})` : `Action ${action.id}`}: ${action.phase}${action.purgeOutcome === 'interrupted' ? '; interrupted purge, remaining contents only' : ''}${action.error ? ` (${action.error})` : ''}\n`);
       for (const source of output.coverage) process.stdout.write(`  ${source.source}: ${source.status}; observed events ${source.observedEvents}\n`);
     }
     else {
       for (const project of output.projects) {
-      process.stdout.write(`${project.project}: ${project.status ?? `${project.decisions.length} worktrees`}; worktree apply disabled\n`);
-      if (project.error) process.stdout.write(`  ${project.error}\n`);
-      for (const decision of project.decisions) process.stdout.write(`  ${decision.status} ${path.normalize(decision.path)}: ${decision.reasons.join(', ')}${decision.error ? ` (${decision.error})` : ''}\n`);
+        const enabled = worktreeApplyEnabled(config, projects.filter(registered => registered.id === project.project));
+        process.stdout.write(`${project.project ?? 'Worktree action'}: ${project.status ?? `${project.decisions.length} worktrees`}; worktree apply ${enabled ? 'enabled' : 'disabled'}\n`);
+        if (project.error) process.stdout.write(`  ${project.error}\n`);
+        for (const decision of project.decisions) {
+          const target = decision.path ? path.normalize(decision.path) : decision.actionId;
+          const selection = decision.status === 'eligible' ? ` [decision ${decision.id}]` : '';
+          process.stdout.write(`  ${decision.status} ${target}${selection}: ${decision.reasons.join(', ')}${decision.error ? ` (${decision.error})` : ''}\n`);
+        }
       }
       for (const decision of output.artifacts) process.stdout.write(`  ${decision.status} artifact ${decision.artifactId}: ${decision.reasons.join(', ')}${decision.error ? ` (${decision.error})` : ''}\n`);
     }

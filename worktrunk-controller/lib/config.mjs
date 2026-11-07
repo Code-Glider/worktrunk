@@ -4,6 +4,11 @@ import { fileURLToPath } from 'node:url';
 import { digest, integer, object, text } from './data.mjs';
 import { localPath, overlap, within } from './paths.mjs';
 
+export function worktreeApplyEnabled(config, projects = config.projects) {
+  return Boolean(config.policy?.allowApply && process.platform === 'win32' && config.nativeHost && projects.some(project =>
+    project.producerAdmission === 'cooperative-windows-job-v1' && config.eventSources.some(source => source.github && source.projects[0] === project.id)));
+}
+
 export function loadConfig(filename) {
   const value = object(JSON.parse(fs.readFileSync(localPath(filename), 'utf8')), 'configuration');
   if (value.version !== 1) throw new Error('Unsupported configuration version');

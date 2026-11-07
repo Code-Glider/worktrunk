@@ -1,8 +1,8 @@
 # Worktrunk controller
 
-This fork adds a controller for worktree cleanup analysis and agent throughput. Durable state, worktree scans, normalized event ingestion, read-only reports, cooperative Windows producer admission, reversible artifact quarantine and selected cache purge are implemented. Worktree actions are still being built. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
+This fork adds a controller for worktree cleanup analysis and agent throughput. It records durable scans and task evidence, produces read-only reports, and supports selected quarantine, restore and retention purge for worktrees and cache on cooperative Windows hosts. See [PROGRESS.md](PROGRESS.md) for acceptance checks and measured results.
 
-Delivery is on GitHub. No service, agent integration or cleanup schedule is installed. `apply` and `purge` support explicitly selected artifact decisions only. The controller never treats ignored agent configuration as disposable cache.
+Delivery is on GitHub. The example scheduler is disabled and runs observation only. `apply` and `purge` require an explicit decision ID and opt-in policy. Ignored agent configuration stays protected.
 
 ## Development
 
@@ -35,7 +35,7 @@ Each inventory item has a decision ID, status and reasons. Logical bytes describ
 
 An enrolled checkout can qualify in a scan when its exact completed attempt and current commit match a recent explicit GitHub acceptance. Run `sync-github-issue` after the managed launch ends and the reviewer accepts its commit. Scans use the last successful read and retain the checkout when that read began more than five minutes ago. Reopening, a higher numbered attempt, or a later producer on the checkout can invalidate the evidence. JSON includes the issue observation time and the task and producer reasons.
 
-For checkout eligibility, the registry project must declare `"producerAdmission":"cooperative-windows-job-v1"` before launch. This asserts that all checkout writers use the native admission contract. The scan verifies the same pinned helper used by the completed launch and checks for active or unresolved claims. Older launches without recorded checkout claim history remain available for throughput. Eligibility is a preview. Worktree apply is disabled.
+For checkout eligibility, the registry project must declare `"producerAdmission":"cooperative-windows-job-v1"` before launch. This asserts that all checkout writers use the native admission contract. The scan verifies the same pinned helper used by the completed launch and checks for active or unresolved claims. Older launches without recorded checkout claim history remain available for throughput. `worktreeApplyEnabled` means at least one selected project has the Windows helper, opt-in policy, producer declaration and GitHub issue binding configured. Eligibility remains a preview until the selected executor verifies current evidence.
 
 ## Scan/report job example
 
@@ -79,7 +79,7 @@ Reports expose the latest two artifact observations. Growth is the logical-byte 
 
 ## Selected artifact quarantine and recovery
 
-With `policy.allowApply=true`, select one eligible artifact decision from the latest scan. The controller acquires a durable cleanup claim, creates an exclusive same-filesystem quarantine container and rechecks the full decision before renaming the enrolled directory into it. Changed content, configuration or identity requires another scan. Worktree decisions are refused. No files or branches are deleted.
+With `policy.allowApply=true`, select one eligible artifact decision from the latest scan. The controller acquires a durable cleanup claim, creates an exclusive same-filesystem quarantine container and rechecks the full decision before moving the enrolled directory into it. Changed content, configuration or identity requires another scan. Quarantine preserves the full directory.
 
 ```console
 node worktrunk-controller/bin/controller.mjs apply --config <absolute-config.json> --decision <artifact-decision-id> --format json
@@ -87,7 +87,7 @@ node worktrunk-controller/bin/controller.mjs reconcile --config <absolute-config
 node worktrunk-controller/bin/controller.mjs restore --config <absolute-config.json> --action <action-id> --format json
 ```
 
-The result includes an action ID and both paths; errors after intent creation include the action ID. Reports list current owned action phases and errors independently of their throughput date window. They read journal state without examining or repairing payloads. `applyEnabled` indicates whether configuration and host support artifact apply; `worktreeApplyEnabled` remains false. Every apply still checks fresh eligibility.
+The result includes an action ID and both paths. Errors after intent creation include the action ID. Reports list current owned action phases and errors independently of their throughput date window. They read journal state without examining or repairing payloads. `applyEnabled` indicates whether configuration and host support artifact apply. Every apply checks fresh eligibility.
 
 Original and quarantine paths remain fenced against cooperative producers until restoration or proven pre-move cancellation. Filesystem moves and reconciliation share a SQLite write lock. If a controller stops, `reconcile` accepts only a matching native incarnation at exactly one location, completes its recorded direction or cancels an operation that provably never moved. It never retries an uncertain rename. Both locations, neither location, replaced parents/containers and a container created without a committed identity remain unresolved with the claim held. Such states require explicit repair; automatic repair is unavailable.
 
@@ -108,6 +108,21 @@ Purge deletes only cache descendants in the selected payload. It returns the sam
 
 An interrupted purge can have deleted some files. Reconcile before proceeding: a verified empty original proves completion; a matching payload stays claimed and is permanently ineligible for another purge on that action. Restore then returns **remaining contents only**, with the interrupted outcome preserved in reports. Both/neither locations, substituted roots or nonempty original outcomes stay unresolved. Reconciliation never resumes deletion.
 
+## Selected worktree cleanup
+
+Select an eligible linked checkout from `scan --project`. Apply reserves the checkout and its repository, refreshes the bound GitHub issue and verifies the exact accepted attempt and commit. It moves the registered checkout into same-filesystem quarantine and applies a controller-owned Git lock. Stable quarantine holds the checkout claim and allows cooperative sibling work. Restore reacquires the repository and returns the original registered checkout even after policy is disabled or the issue reopens.
+
+```console
+node worktrunk-controller/bin/controller.mjs apply --config <absolute-config.json> --decision <worktree-decision-id> --format json
+node worktrunk-controller/bin/controller.mjs restore --config <absolute-config.json> --action <action-id> --format json
+node worktrunk-controller/bin/controller.mjs scan --config <absolute-config.json> --action <action-id> --format json
+node worktrunk-controller/bin/controller.mjs purge --config <absolute-config.json> --decision <worktree-purge-decision-id> --format json
+```
+
+Use `scan --action` after the longer of the original and current retention periods. If the last GitHub read expired, sync the issue and review again. The worktree purge decision appears in `projects[].decisions`. Purge refreshes GitHub under repository ownership and rechecks the selected decision, original contents, refs, lock identity and clock evidence. A reopening, changed checkout or applicable removal hook prevents deletion. Successful purge removes only the selected checkout and its registration. The branch remains available.
+
+Use `reconcile --action` after an interrupted operation. Missing or inconsistent native and Git evidence keeps ownership held. A verified remover refusal can leave the unlocked payload available for explicit restore. Worktree actions appear with their project in reports and are separate from artifact purge totals. Qualification uses disposable Windows fixtures. A real launcher and deployment still need host-specific qualification.
+
 ## Observation boundary
 
 The controller removes inherited Git and Worktrunk overrides, directives and tracing destinations, uses private user/system configuration, disables project display configuration, and bounds child commands and file inventories. It verifies the executable hash before and after invocation. Native Worktrunk uses invocation-private indexes and object storage, skips the shared temporary-index sweep and fallback, suppresses fsmonitor and Git hooks, disables transports/lazy fetch, and refuses configured filters, merge drivers and diff callbacks. Submodule observations are unavailable pending qualification.
@@ -122,7 +137,7 @@ The published observation/telemetry slice passed Windows and Linux CI, including
 
 The isolated native profile also constrains the existing foreground remover to one absolute, noncurrent linked checkout with its branch retained. It refuses applicable user/project hooks, force/reap/approval bypasses, project-config overrides, links, hidden index entries and ignored/untracked content. It fully reads and rehashes retained local Git blobs, then compares raw checkout bytes to catch edits hidden by the stat cache. Missing/corrupt blobs and transformed checkouts, including CRLF content that differs from stored blobs, stay retained.
 
-Selected removal skips repository-wide trash and process housekeeping, custom fsmonitor and direct-removal fallback. Its exclusive staging container cannot replace existing trash. Registration/cleanup failures return nonzero and identify retained staging; teardown results survive later cleanup failures. Failed controller staging is excluded from ordinary trash drains and requires explicit recovery. This is a native prerequisite, not a controller `apply` or `purge` command: cooperative writer exclusion, quarantine, fresh policy checks and durable recovery are still required.
+Selected removal skips repository-wide trash and process housekeeping, custom fsmonitor and direct-removal fallback. Its exclusive staging container cannot replace existing trash. Registration/cleanup failures return nonzero and identify retained staging. Teardown results survive later cleanup failures. Failed controller staging is excluded from ordinary trash drains and requires explicit recovery. The controller calls this native remover only after quarantine and fresh authorization, then verifies the recorded outcome before releasing ownership.
 
 ## Managed producer admission
 
@@ -175,7 +190,7 @@ Sync reads the selected issue through the authenticated GitHub CLI and stores no
 
 To associate a managed launch with an issue, add `--source github --issue 123 --attempt 1` before the program argument separator. Optionally add `--agent <agent-id>` for throughput attribution. The launcher reads the issue and verifies the enrolled checkout before admitting the job. Each launch for the issue requires a higher attempt number, including after an interrupted launch. When the native job proves its processes have exited, the controller records the checkout's final commit.
 
-The report attributes a first acceptance to an explicitly named agent only when the GitHub issue, attempt and commit match and the acceptance timestamp is at or after verified completion. It measures task duration from the admitted first attempt when that start and the accepted attempt are both observed. Command exit status does not establish task acceptance, failure or cancellation. GitHub coverage and first-attempt rates remain partial, and these records do not authorize worktree cleanup.
+The report attributes a first acceptance to an explicitly named agent only when the GitHub issue, attempt and commit match and the acceptance timestamp is at or after verified completion. It measures task duration from the admitted first attempt when that start and the accepted attempt are both observed. Command exit status provides process completion evidence. GitHub coverage and first-attempt rates remain partial. Selected cleanup separately checks current GitHub acceptance and the checkout's preservation evidence.
 
 The report's UTC end date is exclusive and cannot be in the future. Task event types are `task_started`, `attempt_started`, `attempt_accepted`, `attempt_failed`, `attempt_cancelled`, `task_reopened` and `task_revoked`. Host types are `session_started`, `working`, `waiting`, `session_ended` and `association`. Either source may send an independent `checkpoint` with `fromSequence`/`throughSequence` to expose gaps; checkpoints do not occupy an event sequence. Coverage remains partial and unmeasured even when a declared range is complete.
 

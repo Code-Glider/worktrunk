@@ -61,6 +61,176 @@ function worktreeFixture(t) {
   return { s, tracked, raw, config, store, project, fixtures, read, accept };
 }
 
+function worktreeCliFixture(t) {
+  let store;
+  t.after(() => store?.close());
+  const fixture = worktreeFixture(t);
+  ({ store } = fixture);
+  const { s, fixtures } = fixture;
+  const folder = path.join(s.base, 'github fixture');
+  fs.mkdirSync(folder);
+  const source = fileURLToPath(new URL('./fixtures/gh-read.rs', import.meta.url));
+  const build = spawnSync('rustc', [source, '-o', path.join(folder, 'gh.exe')], { encoding: 'utf8', windowsHide: true, timeout: 20000 });
+  assert.equal(build.status, 0, build.stderr || build.error?.message);
+  const write = (name, value) => fs.writeFileSync(path.join(folder, name), JSON.stringify(value));
+  write('repo.json', { id: 22, full_name: 'owner/repo' });
+  write('issue.json', { id: 37, number: 7, repository_url: 'https://api.github.com/repos/owner/repo' });
+  const timeline = (events = fixtures.get(7)) => write('timeline.json', [events]);
+  const env = { ...process.env };
+  const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path') ?? 'Path';
+  env[pathKey] = `${folder}${path.delimiter}${env[pathKey] ?? ''}`;
+  const cli = fileURLToPath(new URL('../bin/controller.mjs', import.meta.url));
+  const invoke = (args, format = 'json') => spawnSync(process.execPath, [cli, '--config', s.filename, '--format', format, ...args],
+    { env, encoding: 'utf8', windowsHide: true, timeout: 45000 });
+  const run = args => {
+    const result = invoke(args);
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    return JSON.parse(result.stdout);
+  };
+  return { ...fixture, timeline, invoke, run, env };
+}
+
+test('public CLI selects a worktree for quarantine and restores it with apply disabled', { skip: process.platform !== 'win32', timeout: 120000 }, async t => {
+  const { s, tracked, raw, store, accept, timeline, invoke, run } = worktreeCliFixture(t);
+  await accept(7);
+  timeline();
+  const snapshot = run(['scan', '--project', 'myproject']);
+  assert.equal(snapshot.worktreeApplyEnabled, true);
+  const selected = snapshot.projects[0].decisions.find(decision => decision.branch === 'refs/heads/agent-7');
+  assert.equal(selected.status, 'eligible', JSON.stringify(selected));
+  const originalRegistration = git(selected.path, 'rev-parse', '--absolute-git-dir');
+  assert.equal(invoke(['purge', '--decision', selected.id]).status, 1);
+  raw.policy.allowApply = false;
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const disabled = invoke(['apply', '--decision', selected.id]);
+  assert.equal(disabled.status, 1);
+  assert.match(disabled.stderr, /Worktree apply requires explicit policy/);
+  assert.equal(store.list('action').length, 0);
+  assert.equal(fs.existsSync(selected.path), true);
+  raw.policy.allowApply = true;
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+
+  const action = run(['apply', '--decision', selected.id]);
+  assert.equal(action.kind, 'worktree');
+  assert.equal(action.phase, 'quarantined');
+  assert.equal(fs.existsSync(selected.path), false);
+  assert.equal(git(action.payloadPath, 'rev-parse', 'HEAD'), selected.head);
+  assert.match(fs.readFileSync(path.join(action.command.gitDir, 'locked'), 'utf8'), new RegExp(action.id));
+
+  raw.policy.allowApply = false;
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const restored = run(['restore', '--action', action.id]);
+  assert.equal(restored.phase, 'restored');
+  assert.equal(run(['reconcile', '--action', action.id]).phase, 'restored');
+  assert.equal(fs.readFileSync(path.join(selected.path, tracked), 'utf8'), 'committed checkout data');
+  assert.equal(git(selected.path, 'rev-parse', '--absolute-git-dir'), originalRegistration);
+  assert.equal(git(selected.path, 'symbolic-ref', 'HEAD'), selected.branch);
+});
+
+test('disposable runner and CLI preserve work until a newly reviewed GitHub acceptance permits purge', { skip: process.platform !== 'win32', timeout: 150000 }, async t => {
+  const { s, config, tracked, store, timeline, invoke, run, env } = worktreeCliFixture(t);
+  const checkout = path.join(s.base, 'agent worktree א');
+  const sibling = path.join(s.base, 'sibling');
+  git(s.root, 'worktree', 'add', '-b', 'agent-7', checkout);
+  git(s.root, 'worktree', 'add', '-b', 'sibling', sibling);
+  const siblingSentinel = path.join(sibling, 'unfinished.txt');
+  fs.writeFileSync(siblingSentinel, 'unique sibling data');
+  const registrations = git(s.root, 'worktree', 'list', '--porcelain');
+  const branch = 'refs/heads/agent-7', head = git(checkout, 'rev-parse', 'HEAD');
+  run(['enroll', '--project', 'myproject', '--path', checkout]);
+  timeline([]);
+  const launch = run(['run', '--project', 'myproject', '--path', checkout, '--session', 'pilot', '--source', 'issues',
+    '--issue', '7', '--attempt', '1', '--agent', 'fixture-agent', '--program', process.execPath, '--', '-e', '']);
+  const claim = store.get('claim', launch.token).value;
+  assert.equal(claim.state, 'ended');
+  assert.equal(claim.endedHead, head);
+  const acceptedAt = Math.ceil(claim.endedAt / 1000) * 1000;
+  await until(() => Date.now() >= acceptedAt);
+  const timestamp = at => new Date(at).toISOString().replace('.000Z', 'Z');
+  const accepted = { event: 'commented', id: 87, user: { type: 'User', id: 5 }, created_at: timestamp(acceptedAt),
+    updated_at: timestamp(acceptedAt), body: `/worktrunk accept 1 ${head}` };
+  const sync = () => run(['sync-github-issue', '--source', 'issues', '--issue', '7']);
+  timeline([accepted]);
+  assert.equal(sync().recorded, 1);
+
+  const runner = fileURLToPath(new URL('../scheduling/scan-report.ps1', import.meta.url));
+  let selected;
+  for (let cycle = 0; cycle < 2; cycle++) {
+    const result = spawnSync(process.env.PWSH_PATH ?? 'pwsh', ['-NoProfile', '-NonInteractive', '-File', runner,
+      '-Node', process.execPath, '-Config', s.filename, '-TimeoutSeconds', '35'], { env, encoding: 'utf8', windowsHide: true, timeout: 42000 });
+    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    assert.match(result.stdout, /worktree apply enabled/);
+    assert.match(result.stdout, /Observed first accepted tasks:/);
+    const current = store.get('scan', 'myproject').value.decisions.find(decision => decision.branch === branch);
+    assert.equal(current.status, 'eligible', JSON.stringify(current));
+    if (selected) assert.equal(current.id, selected.id);
+    selected = current;
+    assert.equal(store.list('action').length, 0);
+    assert.equal(git(s.root, 'worktree', 'list', '--porcelain'), registrations);
+    assert.equal(fs.readFileSync(path.join(checkout, tracked), 'utf8'), 'committed checkout data');
+  }
+
+  const action = run(['apply', '--decision', selected.id]);
+  assert.equal(action.phase, 'quarantined');
+  await until(() => retentionStatus(action.retentionClock, sampleClock(), config.policy.retentionMs) === null);
+  const review = () => {
+    const scan = run(['scan', '--action', action.id]);
+    assert.deepEqual(scan.artifacts, []);
+    assert.equal(scan.projects[0].project, 'myproject');
+    const [decision] = scan.projects[0].decisions;
+    assert.equal(decision.kind, 'worktree_purge');
+    assert.equal(decision.actionId, action.id);
+    return decision;
+  };
+  const first = review();
+  assert.equal(first.status, 'eligible', JSON.stringify(first));
+  assert.equal(invoke(['apply', '--decision', first.id]).status, 1);
+  const lock = path.join(action.command.gitDir, 'locked'), lockBytes = fs.readFileSync(lock);
+  const reopenedAt = acceptedAt + 1000;
+  await until(() => Date.now() >= reopenedAt);
+  const reopened = { event: 'reopened', id: 102, created_at: timestamp(reopenedAt) };
+  timeline([accepted, reopened]);
+  const rejected = invoke(['purge', '--decision', first.id]);
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /issue_reopened/);
+  assert.equal(run(['reconcile', '--action', action.id]).phase, 'quarantined');
+  assert.deepEqual(fs.readFileSync(lock), lockBytes);
+  assert.equal(fs.readFileSync(path.join(action.payloadPath, tracked), 'utf8'), 'committed checkout data');
+  const reportArgs = ['report', '--project', 'myproject', '--from', '1970-01-01', '--to', '2000-01-01'];
+  const reopenedReport = run(reportArgs);
+  assert.equal(reopenedReport.tasks[0].currentOutcome, 'reopened');
+  assert.equal(reopenedReport.tasks[0].firstAcceptedAt, acceptedAt);
+  assert.deepEqual(reopenedReport.tasks[0].agentIds, ['fixture-agent']);
+  assert.equal(reopenedReport.coverage[0].status, 'partial_unmeasured');
+  assert.equal(reopenedReport.actions[0].phase, 'quarantined');
+
+  const approvedAt = reopenedAt + 1000;
+  await until(() => Date.now() >= approvedAt);
+  timeline([accepted, reopened, { ...accepted, id: 88, created_at: timestamp(approvedAt), updated_at: timestamp(approvedAt) }]);
+  assert.equal(sync().recorded, 1);
+  const approved = review();
+  assert.equal(approved.status, 'eligible', JSON.stringify(approved));
+  assert.notEqual(approved.id, first.id);
+  const purged = run(['purge', '--decision', approved.id]);
+  assert.equal(purged.phase, 'purged');
+  assert.equal(fs.existsSync(action.payloadPath), false);
+  assert.equal(fs.existsSync(action.command.gitDir), false);
+  assert.equal(git(s.root, 'rev-parse', branch), head);
+  assert.equal(fs.readFileSync(siblingSentinel, 'utf8'), 'unique sibling data');
+  assert.equal(git(sibling, 'symbolic-ref', 'HEAD'), 'refs/heads/sibling');
+
+  const state = path.join(s.state, 'controller.sqlite'), before = fs.readFileSync(state);
+  const completed = run(reportArgs);
+  assert.equal(completed.tasks[0].currentOutcome, 'accepted');
+  assert.deepEqual(completed.artifactPurges, { observedActions: 0, logicalBytes: 0, unavailableTimeActions: 0 });
+  assert.deepEqual(completed.actions.map(item => [item.id, item.kind, item.project, item.phase, item.purgeOutcome]),
+    [[action.id, 'worktree', 'myproject', 'purged', 'complete']]);
+  const rendered = invoke(reportArgs, 'text');
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, new RegExp(`Worktree action ${action.id} \\(myproject\\): purged`));
+  assert.deepEqual(fs.readFileSync(state), before);
+});
+
 test('worktree cleanup intent owns the checkout and repository through quarantine and restore recovery', { skip: process.platform !== 'win32', timeout: 120000 }, async t => {
   const { s, tracked, raw, config, store, project, fixtures, read, accept } = worktreeFixture(t);
   try {
