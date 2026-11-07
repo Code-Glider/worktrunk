@@ -209,4 +209,20 @@ Both formats report observed throughput for the selected window and task status 
 
 `report` requires existing state and opens SQLite read-only; it never initializes a database. Conflicting simultaneous session states without source ordering and known source-sequence gaps across intervals make session durations and overlap unavailable. Sequences belong to the entire source, so known events from another session or project fill their sequence positions. State-only events preserve the last explicit repository/worktree association.
 
-The native marker setter and Claude direct helper optionally record host observations when a launcher supplies all of `WORKTRUNK_OBSERVER_NODE`, `WORKTRUNK_OBSERVER_SCRIPT`, `WORKTRUNK_OBSERVER_CONFIG` (absolute paths), `WORKTRUNK_OBSERVER_SOURCE` and `WORKTRUNK_OBSERVER_PROJECT`. Generic markers also require `WORKTRUNK_OBSERVER_SESSION`; Claude supplies its payload's session ID. The source must have role `host`. Working/waiting markers record their corresponding state; clearing a marker or Claude SessionEnd ends only that session. Claude Stop means waiting. Recording is bounded to two seconds, failure preserves the original marker/hook result, and the raw Claude payload is never forwarded. Installation and launcher wiring are deferred. Observations grant neither managed producer ownership nor cleanup permission.
+The native marker setter and Claude direct helper optionally record host observations when a launcher supplies `WORKTRUNK_OBSERVER_NODE`, `WORKTRUNK_OBSERVER_SCRIPT`, `WORKTRUNK_OBSERVER_CONFIG` (absolute paths), `WORKTRUNK_OBSERVER_SOURCE` and `WORKTRUNK_OBSERVER_PROJECT`. Generic markers also require `WORKTRUNK_OBSERVER_SESSION`. Claude supplies its own session ID. Working and waiting markers record the corresponding state. Claude Stop means waiting, and SessionEnd ends that session. Recording is bounded to two seconds. A recording failure preserves the hook result, and the observer forwards only normalized event fields.
+
+### Observe a disposable Claude Code session in WSL
+
+Prepare a private controller configuration with `host.platform` set to `linux`, a registered disposable Git checkout, a pinned Linux Worktrunk binary, and `policy.allowApply` set to `false`. Add a host source with `id` set to `claude`, a unique `instance`, and the disposable checkout's project ID in `projects`. From that checkout, pass the observer settings to the actual Claude process.
+
+```bash
+WORKTRUNK_BIN=/absolute/path/to/wt \
+WORKTRUNK_OBSERVER_NODE=/absolute/path/to/node \
+WORKTRUNK_OBSERVER_SCRIPT=/absolute/path/to/worktrunk/worktrunk-controller/bin/controller.mjs \
+WORKTRUNK_OBSERVER_CONFIG=/absolute/path/to/private/controller.json \
+WORKTRUNK_OBSERVER_SOURCE=claude \
+WORKTRUNK_OBSERVER_PROJECT=disposable-project \
+claude --plugin-dir /absolute/path/to/worktrunk/plugins/worktrunk
+```
+
+Submit a prompt and exit, then check `sessions` and `coverage` in the controller's JSON report. The plugin also registers WorktreeCreate and WorktreeRemove handlers. Use the disposable checkout directly for this telemetry check. Observations grant no managed producer ownership or cleanup permission. See [PROGRESS.md](PROGRESS.md#qualify-real-claude-code-hook-delivery-in-wsl) for the isolated pilot results.

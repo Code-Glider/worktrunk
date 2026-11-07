@@ -411,3 +411,16 @@ Review. The real adapter read and bulk-refreshed upstream issues 4709 and 4717 t
 
 - The regression failed on the missing JSON field before the change. The focused Windows suite passed all 22 tests. Ubuntu WSL passed all 55 related tests with Node 24.15.0 on its native filesystem. The live GitHub probe showed both issue reads in JSON and text, with zero task outcomes and byte-identical SQLite state after reporting.
 - GPT-6 Astra (high) approved the change in one ds-review-loop round with no findings. The reviewer independently passed all 22 focused tests. JavaScript syntax and Git whitespace checks passed.
+
+## Qualify real Claude Code hook delivery in WSL
+
+1. Launch the installed Claude Code executable in a disposable Git checkout with only a loopback interface, a fresh home, and a local model fixture. Check that Claude supplies working, waiting, and end callbacks under one stable session ID.
+2. Repeat with the repository's actual Claude plugin, a pinned Linux Worktrunk binary, and the controller CLI. Check that the report records the delivered lifecycle and partial coverage with zero inferred task outcomes or cleanup actions.
+3. Run a separate session with an unavailable observer. Check that Claude still finishes and that its Worktrunk marker clears. Record which launcher, binary, checkout, and storage boundaries the pilot exercised.
+
+Review. A real CLI process can exercise hook delivery without using an external model or the user's Claude settings. A transport probe alone cannot qualify the native Worktrunk hook or SQLite. Bind the existing plugin read-only and preserve its command path in the second pass. The Archon and Incus/OpenCode launch paths require separate evidence. This pilot exercises telemetry only.
+
+- Claude Code 2.1.316 ran in a disposable WSL Git checkout with a fresh home and an isolated network namespace. The only interface was loopback. A local model fixture received one request. The initial probe captured SessionStart, UserPromptSubmit, Stop and SessionEnd with one stable session ID.
+- The second probe loaded the real Worktrunk plugin and controller from c42147ea733c3519bbc3cd7b9ff849a8febd9ca8. It used the Linux Worktrunk binary from Gitea minimum-Git run 31 at 357c0725034c96e43a05bd6d41c341f7c49a6fa3, pinned to SHA-256 d8fb968f45131cd8a12d28868f5f4de8478b32f52493caf3d330318b52eaf0e0. The revisions had identical Cargo, Rust and plugin sources. The report showed one ended session with three observed events, partial coverage, zero tasks or actions, and apply disabled. The event rows were working, waiting and session_ended under the same native ID.
+- A second real plugin session with a missing observer configuration still returned the model fixture response and exited successfully. Git contained the working marker during both model requests and cleared it after both sessions. The SQLite bytes stayed unchanged after reporting and the failed recording. The test left launcher installation, checkout association, and production qualification open.
+- GPT-6 Astra (high) approved the instructions in one ds-review-loop round. The reviewer checked the environment and lifecycle contracts against the code, verified the unchanged native source and plugin, and passed the Git whitespace check. The review used the recorded pilot output.
