@@ -182,3 +182,31 @@ test('only a bound journaled relocation fences the original and payload without 
   fs.renameSync(containerPath, path.join(s.base, 'moved-container')); fs.mkdirSync(containerPath);
   assert.throws(() => reserve(s.store, { roots: [other], owner: 'host', sessionId: 'substituted' }), /Cleanup/);
 });
+
+test('a stable worktree quarantine protects its paths without blocking a sibling quarantine', t => {
+  const s = setup(t);
+  const sibling = path.join(s.base, 'sibling');
+  fs.mkdirSync(sibling);
+  const repositoryIncarnation = fileIdentity(s.base);
+  function begin(id, originalPath, repositoryPaths) {
+    const containerPath = path.join(s.base, id);
+    return acquireCleanup(s.store, { roots: [originalPath], owner: 'host', actionId: id }, (tx, claim) => {
+      tx.put('action', id, { version: 1, id, kind: 'worktree', claimToken: claim.token, owner: claim.owner, originalPath,
+        originalParent: repositoryIncarnation, incarnation: fileIdentity(originalPath), containerPath,
+        containerIdentity: null, payloadPath: path.join(containerPath, 'payload'), phase: 'intent', repositoryPaths, repositoryIncarnation });
+    });
+  }
+  const first = begin('first', s.root, [s.root, sibling]);
+  const action = s.store.get('action', 'first').value;
+  assert.throws(() => begin('second', sibling, [s.root, sibling]), /owner\/cleanup claim/);
+  fs.mkdirSync(action.containerPath);
+  fs.renameSync(s.root, action.payloadPath);
+  s.store.transaction(tx => {
+    tx.put('action', action.id, { ...action, phase: 'quarantined', containerIdentity: fileIdentity(action.containerPath) });
+    tx.put('claim', first.token, { ...first, roots: [{ ...first.roots[0], currentPath: action.payloadPath }] });
+  });
+  assert.equal(begin('second', sibling, [sibling, action.payloadPath]).state, 'held');
+  for (const root of [action.containerPath, action.payloadPath, sibling]) {
+    assert.throws(() => reserve(s.store, { roots: [root], owner: 'host', sessionId: 'blocked' }), /Cleanup claim/);
+  }
+});

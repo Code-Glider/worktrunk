@@ -8,7 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Store } from '../lib/store.mjs';
-import { beginWorktreeAction, moveWorktreeToQuarantine, reconcile, refreshWorktreeAuthority, verifyWorktreeAction } from '../lib/actions.mjs';
+import { beginWorktreeAction, lockWorktreeQuarantine, moveWorktreeToQuarantine, reconcile, refreshWorktreeAuthority, restoreWorktree, verifyWorktreeAction } from '../lib/actions.mjs';
 import { acquireCleanup, inactive, releaseCleanup, reserve, transition } from '../lib/admission.mjs';
 import { enrollArtifact } from '../lib/artifacts.mjs';
 import { loadConfig } from '../lib/config.mjs';
@@ -23,7 +23,7 @@ import { controller, fixture, git, nativeWorktrunk } from './helpers.mjs';
 const host = nativeWorktrunk('wt-controller-host');
 const binary = process.platform === 'win32' ? nativeWorktrunk() : null;
 
-test('worktree cleanup intent owns the checkout and repository through move recovery', { skip: process.platform !== 'win32', timeout: 120000 }, async t => {
+test('worktree cleanup intent owns the checkout and repository through quarantine and restore recovery', { skip: process.platform !== 'win32', timeout: 120000 }, async t => {
   const s = controller(t, binary);
   git(s.root, 'config', 'worktrunk.default-branch', 'main');
   const tracked = 'tracked-sentinel.txt';
@@ -134,6 +134,13 @@ test('worktree cleanup intent owns the checkout and repository through move reco
     assert.equal(store.get('claim', retry.claimToken).value.state, 'released');
 
     const bytes = fs.readFileSync(path.join(other.path, tracked));
+    const beforeLock = await moveWorktreeToQuarantine(config, store, other.id, read);
+    assert.equal(beforeLock.phase, 'moved');
+    const returned = await restoreWorktree(config, store, beforeLock.id);
+    assert.equal(returned.phase, 'restored');
+    assert.equal(store.get('identity', beforeLock.worktreeId).value.path, beforeLock.originalPath);
+    assert.equal(store.get('claim', beforeLock.claimToken).value.state, 'released');
+    assert.deepEqual(fs.readFileSync(path.join(other.path, tracked)), bytes);
     store.db.exec("CREATE TRIGGER fail_move BEFORE INSERT ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='moved' BEGIN SELECT RAISE(ABORT,'injected move completion failure'); END;");
     await assert.rejects(moveWorktreeToQuarantine(config, store, other.id, read), /move completion failure/);
     store.db.exec('DROP TRIGGER fail_move');
@@ -164,6 +171,113 @@ test('worktree cleanup intent owns the checkout and repository through move reco
       assert.equal(git(moved.payloadPath, 'rev-parse', 'HEAD'), other.head);
       assert.equal(git(selected.path, 'rev-parse', 'HEAD'), selected.head);
       assert.throws(() => reserve(recovering, { roots: [s.root], owner: config.host.id, sessionId: 'after-move' }), /Cleanup claim/);
+
+      const lock = path.join(moved.command.gitDir, 'locked');
+      git(s.root, 'worktree', 'lock', '--reason', 'user lock', '--', moved.payloadPath);
+      await assert.rejects(lockWorktreeQuarantine(config, recovering, moved.id), /already locked/);
+      assert.equal(fs.readFileSync(lock, 'utf8').trim(), 'user lock');
+      git(s.root, 'worktree', 'unlock', '--', moved.payloadPath);
+      recovering.db.exec("CREATE TRIGGER fail_lock BEFORE INSERT ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='quarantined' BEGIN SELECT RAISE(ABORT,'injected lock completion failure'); END;");
+      await assert.rejects(lockWorktreeQuarantine(config, recovering, moved.id), /lock completion failure/);
+      recovering.db.exec('DROP TRIGGER fail_lock');
+      const locking = recovering.get('action', moved.id).value;
+      assert.equal(locking.phase, 'locking');
+      assert.equal(readCommandCompletion(config, locking.lockCommand.launch).exitCode, 0);
+      const lockBytes = fs.readFileSync(lock);
+      fs.writeFileSync(lock, 'different lock owner\n');
+      try { assert.throws(() => reconcile(config, recovering, moved.id), /lock ownership differs/); }
+      finally { fs.writeFileSync(lock, lockBytes); }
+      const quarantined = reconcile(config, recovering, moved.id);
+      assert.equal(quarantined.phase, 'quarantined');
+      assert.equal(quarantined.lockCommand.exitCode, 0);
+      assert.equal(quarantined.quarantinedAt, quarantined.retentionClock.wallMs);
+      assert.equal(recovering.get('claim', moved.claimToken).value.state, 'held');
+      assert.equal(fs.readFileSync(lock, 'utf8').trim(), `worktrunk-controller quarantine ${moved.id}`);
+      assert.throws(() => reserve(recovering, { roots: [moved.payloadPath], owner: config.host.id, sessionId: 'stable-payload' }), /Cleanup claim/);
+
+      const sibling = reserve(recovering, { roots: [s.root], owner: config.host.id, sessionId: 'stable-sibling' });
+      await assert.rejects(restoreWorktree(config, recovering, moved.id), /owner\/cleanup claim/);
+      assert.equal(recovering.get('action', moved.id).value.phase, 'quarantined');
+      assert.deepEqual(fs.readFileSync(lock), lockBytes);
+      const siblingJob = { kind: 'windows_job', launchToken: sibling.token, helperPid: 1, activeProcesses: null };
+      transition(recovering, sibling.token, 'reserved', 'starting');
+      transition(recovering, sibling.token, 'starting', 'running', siblingJob);
+      transition(recovering, sibling.token, 'running', 'ended', { ...siblingJob, activeProcesses: 1 });
+
+      fs.mkdirSync(moved.originalPath);
+      try { await assert.rejects(restoreWorktree(config, recovering, moved.id), /locations are ambiguous/); }
+      finally { fs.rmdirSync(moved.originalPath); }
+      const oldLock = `${lock}.original`;
+      fs.renameSync(lock, oldLock);
+      fs.writeFileSync(lock, lockBytes);
+      try {
+        await assert.rejects(restoreWorktree(config, recovering, moved.id), /lock incarnation changed/);
+        assert.deepEqual(fs.readFileSync(lock), lockBytes);
+      } finally {
+        fs.unlinkSync(lock);
+        fs.renameSync(oldLock, lock);
+      }
+
+      const siblingAddedDuringQuarantine = path.join(s.base, 'new-sibling');
+      git(s.root, 'worktree', 'add', '--detach', siblingAddedDuringQuarantine);
+      const [accepted] = fixtures.get(moved.issue);
+      const reopenedTime = Date.parse(accepted.created_at) + 1000;
+      await until(() => Date.now() >= reopenedTime);
+      fixtures.set(moved.issue, [accepted, { event: 'reopened', id: 102, created_at: new Date(reopenedTime).toISOString().replace('.000Z', 'Z') }]);
+      await syncGitHubIssue(config, recovering, 'issues', moved.issue, read);
+      fs.writeFileSync(s.filename, JSON.stringify({ ...raw, policy: { ...raw.policy, allowApply: false } }));
+      const restoreConfig = loadConfig(s.filename);
+      recovering.db.exec("CREATE TRIGGER fail_unlock BEFORE INSERT ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='unlocked' BEGIN SELECT RAISE(ABORT,'injected unlock completion failure'); END;");
+      await assert.rejects(restoreWorktree(restoreConfig, recovering, moved.id), /unlock completion failure/);
+      recovering.db.exec('DROP TRIGGER fail_unlock');
+      const unlocking = recovering.get('action', moved.id).value;
+      assert.equal(unlocking.phase, 'unlocking');
+      assert.equal(readCommandCompletion(config, unlocking.unlockCommand.launch).exitCode, 0);
+      assert.equal(fs.existsSync(lock), false);
+      assert.throws(() => reserve(recovering, { roots: [s.root], owner: config.host.id, sessionId: 'during-unlock' }), /Cleanup claim/);
+      assert.equal(reconcile(restoreConfig, recovering, moved.id).phase, 'unlocked');
+      assert.equal(recovering.get('claim', moved.claimToken).value.state, 'held');
+      assert.throws(() => reserve(recovering, { roots: [siblingAddedDuringQuarantine], owner: config.host.id, sessionId: 'new-sibling' }), /Cleanup claim/);
+      fs.mkdirSync(moved.originalPath);
+      const occupant = path.join(moved.originalPath, 'occupant.txt');
+      fs.writeFileSync(occupant, 'existing data');
+      try {
+        await assert.rejects(restoreWorktree(restoreConfig, recovering, moved.id), /locations are ambiguous/);
+        assert.equal(fs.readFileSync(occupant, 'utf8'), 'existing data');
+      } finally {
+        fs.unlinkSync(occupant);
+        fs.rmdirSync(moved.originalPath);
+      }
+
+      const unique = 'preserve-on-restore.txt';
+      fs.writeFileSync(path.join(moved.payloadPath, unique), 'additional data');
+      recovering.db.exec("CREATE TRIGGER fail_restore BEFORE INSERT ON records WHEN NEW.kind='action' AND json_extract(NEW.body,'$.phase')='restored' BEGIN SELECT RAISE(ABORT,'injected restore completion failure'); END;");
+      await assert.rejects(restoreWorktree(restoreConfig, recovering, moved.id), /restore completion failure/);
+      recovering.db.exec('DROP TRIGGER fail_restore');
+      const restoring = recovering.get('action', moved.id).value;
+      assert.equal(restoring.phase, 'restoring');
+      assert.equal(readCommandCompletion(restoreConfig, restoring.restoreCommand.launch).exitCode, 0);
+      const receipt = path.join(config.stateDir, `${restoring.restoreCommand.launch.evidence.launchToken}.native-completion`);
+      fs.renameSync(receipt, `${receipt}.held`);
+      try { assert.throws(() => reconcile(restoreConfig, recovering, moved.id), /Native worktree restore completion unavailable/); }
+      finally { fs.renameSync(`${receipt}.held`, receipt); }
+      assert.equal(recovering.get('identity', moved.worktreeId).value.path, moved.payloadPath);
+      assert.equal(recovering.get('claim', moved.claimToken).value.state, 'held');
+      assert.equal(fs.existsSync(moved.payloadPath), false);
+      const afterRestore = new Store(config.stateDir);
+      try {
+        const restored = reconcile(restoreConfig, afterRestore, moved.id);
+        assert.equal(restored.phase, 'restored');
+        assert.equal(afterRestore.get('identity', moved.worktreeId).value.path, moved.originalPath);
+        assert.equal(afterRestore.get('claim', moved.claimToken).value.state, 'released');
+        assert.deepEqual(await restoreWorktree(restoreConfig, afterRestore, moved.id), restored);
+        assert.equal(reserve(afterRestore, { roots: [moved.originalPath], owner: config.host.id, sessionId: 'restored-checkout' }).state, 'reserved');
+      } finally { afterRestore.close(); }
+      assert.equal(git(moved.originalPath, 'rev-parse', 'HEAD'), other.head);
+      assert.equal(git(moved.originalPath, 'symbolic-ref', 'HEAD'), other.branch);
+      assert.deepEqual(fs.readFileSync(path.join(moved.originalPath, tracked)), bytes);
+      assert.equal(fs.readFileSync(path.join(moved.originalPath, unique), 'utf8'), 'additional data');
+      assert.equal(git(selected.path, 'rev-parse', 'HEAD'), selected.head);
     } finally { recovering.close(); }
   } finally { store.close(); }
 });

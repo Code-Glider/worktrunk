@@ -1,11 +1,11 @@
-// Intent, container preparation and move commit separately. A SQLite write lock
-// serializes every filesystem step with restore/reconcile; uncertain moves retain claims.
+// Artifact moves serialize with SQLite. Worktree commands start only after their
+// journal commit and retain ownership until the native receipt and Git agree.
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { digest, integer, text } from './data.mjs';
-import { fileIdentity, localPath } from './paths.mjs';
-import { acquireCleanup, holdsWorktreeRepository } from './admission.mjs';
+import { fileIdentity, localPath, overlap } from './paths.mjs';
+import { acquireCleanup, holdsWorktreeRepository, verifyCleanupFences } from './admission.mjs';
 import { inspectArtifact } from './artifacts.mjs';
 import { loadConfig } from './config.mjs';
 import { syncGitHubIssueSnapshot } from './events.mjs';
@@ -29,7 +29,7 @@ function at(filename) {
 function read(config, tx, id, kind = 'artifact') {
   const action = tx.get('action', text(id, 'action ID'))?.value;
   if (!action || action.kind !== kind || action.id !== id || !/^[a-f0-9-]{36}$/.test(id) || action.owner !== config.host.id || action.domain !== process.platform) throw new Error(`Matching owned ${kind} action required`);
-  if (!['intent', 'prepared', 'moving', 'moved', 'quarantined', 'restoring', 'restored', 'cancelled', 'purging', 'purged'].includes(action.phase)) throw new Error('Unsupported action phase');
+  if (!['intent', 'prepared', 'moving', 'moved', 'locking', 'quarantined', 'unlocking', 'unlocked', 'restoring', 'restored', 'cancelled', 'purging', 'purged'].includes(action.phase)) throw new Error('Unsupported action phase');
   if (action.quarantineRoot !== config.quarantineDir || action.containerPath !== path.join(config.quarantineDir, id) || action.payloadPath !== path.join(action.containerPath, 'payload')) throw new Error('Quarantine boundary does not match manifest');
   const claim = tx.get('claim', action.claimToken)?.value;
   if (!claim || claim.actionId !== id || claim.token !== action.claimToken || claim.kind !== 'cleanup' || claim.owner !== action.owner || claim.roots.length !== 1 || claim.roots[0].path !== action.originalPath || !same(claim.roots[0].incarnation, action.incarnation) || claim.state !== (terminal.has(action.phase) ? 'released' : 'held')) throw new Error('Action ownership claim unavailable');
@@ -57,7 +57,7 @@ function location(action) {
 function complete(tx, action, claim, phase) {
   const next = { ...action, phase, error: null };
   tx.put('action', action.id, next);
-  tx.put('claim', claim.token, { ...claim, state: terminal.has(phase) ? 'released' : 'held', roots: [{ path: action.originalPath, incarnation: action.incarnation, ...(['moved', 'quarantined', 'purging'].includes(phase) ? { currentPath: action.payloadPath } : {}) }] });
+  tx.put('claim', claim.token, { ...claim, state: terminal.has(phase) ? 'released' : 'held', roots: [{ path: action.originalPath, incarnation: action.incarnation, ...(['moved', 'quarantined', 'unlocked', 'purging'].includes(phase) ? { currentPath: action.payloadPath } : {}) }] });
   return next;
 }
 
@@ -120,7 +120,7 @@ export function beginWorktreeAction(config, store, decisionId) {
     const issueKey = digest([sourceInstance, issue]);
     const initialIssueRevision = tx.get('github_issue', issueKey)?.revision;
     if (!initialIssueRevision) throw new Error('Selected worktree issue snapshot unavailable');
-    return { project: project.id, repositoryIncarnation: checkout.repositoryIncarnation, repositoryPaths: repositoryPaths(checkout), worktreeId: checkout.worktreeId, sourceInstance, issue, initialIssueRevision };
+    return { project: project.id, repositoryIncarnation: checkout.repositoryIncarnation, repositoryPaths: repositoryPaths(checkout), worktreeId: checkout.worktreeId, sourceInstance, issue, initialIssueRevision, retentionMs: config.policy.retentionMs };
   });
 }
 
@@ -166,21 +166,93 @@ export function verifyWorktreeAction(config, tx, actionId, issueRevision) {
   return fresh;
 }
 
+function worktreeRegistration(config, tx, action, root, fixedLayout = true) {
+  const project = config.projects.find(project => project.id === action.project);
+  if (!project) throw new Error('Worktree project unavailable during recovery');
+  const checkout = managedCheckout(config, tx, project, root, true);
+  const registration = checkout.worktrees.find(entry => path.relative(root, entry.path) === '');
+  const paths = repositoryPaths(checkout);
+  const expectedPaths = action.repositoryPaths.map(filename => filename === action.originalPath ? root : filename).sort();
+  if (!registration || (registration.branch ?? null) !== action.command.branch || checkout.head !== action.command.head ||
+      checkout.worktreeId !== action.worktreeId || !same(checkout.repositoryIncarnation, action.repositoryIncarnation) ||
+      tx.get('identity', action.worktreeId)?.value.gitDir !== action.command.gitDir ||
+      (fixedLayout && !same(paths, expectedPaths))) throw new Error('Worktree registration differs from the admitted checkout');
+  return { registration, paths };
+}
+
 function reconcileWorktreeMove(config, tx, action, claim) {
   const receipt = readCommandCompletion(config, action.command.launch);
   if (!receipt) throw new Error('Native worktree move completion unavailable');
   const found = location(action);
   const root = found === 'original' ? action.originalPath : action.payloadPath;
-  const project = config.projects.find(project => project.id === action.project);
-  if (!project) throw new Error('Worktree project unavailable during recovery');
   if (found === 'payload') recordRelocation(tx, action.worktreeId, root, action.command.gitDir);
-  const checkout = managedCheckout(config, tx, project, root, true);
-  const registration = checkout.worktrees.find(entry => path.relative(root, entry.path) === '');
-  const expectedPaths = action.repositoryPaths.map(filename => filename === action.originalPath ? root : filename).sort();
-  if (!registration || registration.locked || (registration.branch ?? null) !== action.command.branch || checkout.head !== action.command.head ||
-      checkout.worktreeId !== action.worktreeId || !same(checkout.repositoryIncarnation, action.repositoryIncarnation) ||
-      !same(repositoryPaths(checkout), expectedPaths)) throw new Error('Worktree move registration differs from the admitted checkout');
+  if (worktreeRegistration(config, tx, action, root).registration.locked) throw new Error('Worktree move registration unexpectedly locked');
   return complete(tx, { ...action, moveExitCode: receipt.exitCode }, claim, found === 'payload' ? 'moved' : 'cancelled');
+}
+
+const quarantineReason = action => `worktrunk-controller quarantine ${action.id}`;
+
+function quarantineLock(action, registration) {
+  const filename = path.join(action.command.gitDir, 'locked');
+  const identity = at(filename);
+  if (!identity && registration.locked === undefined) return null;
+  const expected = Buffer.from(`${quarantineReason(action)}\n`);
+  const stat = identity && fs.lstatSync(filename);
+  if (registration.locked !== quarantineReason(action) || !stat?.isFile() || stat.nlink !== 1 ||
+      stat.size !== expected.length || !fs.readFileSync(filename).equals(expected)) throw new Error('Worktree quarantine lock ownership differs');
+  return identity;
+}
+
+function reconcileWorktreeLock(config, tx, action, claim) {
+  const receipt = readCommandCompletion(config, action.lockCommand.launch);
+  if (!receipt) throw new Error('Native worktree lock completion unavailable');
+  if (location(action) !== 'payload') throw new Error('Worktree lock payload is unavailable');
+  const { registration } = worktreeRegistration(config, tx, action, action.payloadPath);
+  const identity = quarantineLock(action, registration);
+  const next = { ...action, lockCommand: { ...action.lockCommand, exitCode: receipt.exitCode } };
+  if (!identity && receipt.exitCode !== 0) return complete(tx, next, claim, 'moved');
+  if (!identity || receipt.exitCode !== 0) throw new Error('Worktree quarantine lock outcome unavailable');
+  const retentionClock = sampleClock();
+  return complete(tx, { ...next, lockIdentity: identity, quarantinedAt: retentionClock.wallMs, retentionClock, retentionMs: action.retentionMs ?? config.policy.retentionMs }, claim, 'quarantined');
+}
+
+function reconcileWorktreeUnlock(config, tx, action, claim) {
+  const receipt = readCommandCompletion(config, action.unlockCommand.launch);
+  if (!receipt) throw new Error('Native worktree unlock completion unavailable');
+  if (location(action) !== 'payload') throw new Error('Worktree unlock payload is unavailable');
+  const { registration } = worktreeRegistration(config, tx, action, action.payloadPath);
+  const identity = quarantineLock(action, registration);
+  const next = { ...action, unlockCommand: { ...action.unlockCommand, exitCode: receipt.exitCode } };
+  if (identity && same(identity, action.lockIdentity) && receipt.exitCode !== 0) return complete(tx, next, claim, 'quarantined');
+  if (identity || receipt.exitCode !== 0) throw new Error('Worktree quarantine unlock outcome unavailable');
+  return complete(tx, next, claim, 'unlocked');
+}
+
+function reconcileWorktreeRestore(config, tx, action, claim) {
+  const receipt = readCommandCompletion(config, action.restoreCommand.launch);
+  if (!receipt) throw new Error('Native worktree restore completion unavailable');
+  const found = location(action);
+  const root = found === 'original' ? action.originalPath : action.payloadPath;
+  if (found === 'original') recordRelocation(tx, action.worktreeId, root, action.command.gitDir);
+  const { registration } = worktreeRegistration(config, tx, action, root);
+  if (quarantineLock(action, registration) || (receipt.exitCode === 0 && found !== 'original')) throw new Error('Worktree restore outcome unavailable');
+  const next = { ...action, restoreCommand: { ...action.restoreCommand, exitCode: receipt.exitCode } };
+  return complete(tx, next, claim, found === 'original' ? 'restored' : 'unlocked');
+}
+
+async function runWorktreeGit(config, store, action, args, authorize) {
+  const project = config.projects.find(project => project.id === action.project);
+  if (!project) throw new Error('Worktree project unavailable');
+  const program = invocation(config, project.root, ({ git }) => localPath(path.join(git(['--exec-path']).trim(), 'git.exe')));
+  const identity = fileIdentity(program), scope = openInvocation(config);
+  await runJournaledCommand(config, store, { root: project.root, program, env: scope.env,
+    args: isolatedGitArgs(scope.scratch, ['worktree', ...args]) }, (tx, launch) => {
+    if (!same(fileIdentity(program), identity)) throw new Error('Git executable changed before worktree authorization');
+    authorize(tx, launch);
+  });
+  const result = store.transaction(tx => reconcileWorktree(config, tx, read(config, tx, action.id, 'worktree')));
+  scope.dispose();
+  return result;
 }
 
 export async function moveWorktreeToQuarantine(config, store, decisionId, request) {
@@ -188,22 +260,63 @@ export async function moveWorktreeToQuarantine(config, store, decisionId, reques
   const id = intent.id;
   try {
     const issueRevision = await refreshWorktreeAuthority(config, store, id, request);
-    const project = config.projects.find(project => project.id === intent.project);
-    const program = invocation(config, project.root, ({ git }) => localPath(path.join(git(['--exec-path']).trim(), 'git.exe')));
-    const programIdentity = fileIdentity(program);
     store.transaction(tx => prepareQuarantine(tx, read(config, tx, id, 'worktree').action));
-    const scope = openInvocation(config);
-    await runJournaledCommand(config, store, { root: project.root, program, env: scope.env,
-      args: isolatedGitArgs(scope.scratch, ['worktree', 'move', '--', intent.originalPath, intent.payloadPath]) }, (tx, launch) => {
+    const moved = await runWorktreeGit(config, store, intent, ['move', '--', intent.originalPath, intent.payloadPath], (tx, launch) => {
       const fresh = verifyWorktreeAction(config, tx, id, issueRevision);
       const { action } = read(config, tx, id, 'worktree');
-      if (action.phase !== 'prepared' || !same(fileIdentity(program), programIdentity)) throw new Error('Worktree move preparation changed');
+      if (action.phase !== 'prepared') throw new Error('Worktree move preparation changed');
       tx.put('action', id, { ...action, phase: 'moving', command: { launch, head: fresh.head, branch: fresh.branch, gitDir: fresh.evidence.gitDir } });
     });
-    const moved = reconcile(config, store, id);
-    scope.dispose();
     if (moved.phase !== 'moved' || moved.moveExitCode !== 0) throw new Error('Git worktree move did not succeed');
     return moved;
+  } catch (error) { return failed(config, store, id, error); }
+}
+
+export async function lockWorktreeQuarantine(config, store, id) {
+  try {
+    const { action } = read(config, store, id, 'worktree');
+    const locked = await runWorktreeGit(config, store, action, ['lock', '--reason', quarantineReason(action), '--', action.payloadPath], (tx, launch) => {
+      const { action } = read(config, tx, id, 'worktree');
+      if (action.phase !== 'moved' || location(action) !== 'payload') throw new Error('Verified worktree move required before locking');
+      const { registration } = worktreeRegistration(config, tx, action, action.payloadPath);
+      if (registration.locked !== undefined || at(path.join(action.command.gitDir, 'locked'))) throw new Error('Worktree already locked');
+      tx.put('action', id, { ...action, phase: 'locking', lockCommand: { launch } });
+    });
+    if (locked.phase !== 'quarantined') throw new Error('Git worktree lock did not succeed');
+    return locked;
+  } catch (error) { return failed(config, store, id, error); }
+}
+
+function unlockWorktreeForRestore(config, store, action) {
+  const id = action.id;
+  return runWorktreeGit(config, store, action, ['unlock', '--', action.payloadPath], (tx, launch) => {
+    const { action, claim } = read(config, tx, id, 'worktree');
+    if (action.phase !== 'quarantined' || location(action) !== 'payload') throw new Error('Verified worktree quarantine required before unlocking');
+    const { registration, paths } = worktreeRegistration(config, tx, action, action.payloadPath, false);
+    const identity = quarantineLock(action, registration);
+    if (!identity || !same(identity, action.lockIdentity)) throw new Error('Worktree quarantine lock incarnation changed');
+    if (paths.some(filename => filename !== action.payloadPath && (overlap(filename, action.originalPath) || overlap(filename, action.payloadPath)))) throw new Error('Worktree restore overlaps another checkout');
+    const currentPaths = paths.map(filename => filename === action.payloadPath ? action.originalPath : filename).sort();
+    tx.put('action', id, { ...action, phase: 'unlocking', repositoryPaths: currentPaths, unlockCommand: { launch } });
+    verifyCleanupFences(tx, claim);
+  });
+}
+
+export async function restoreWorktree(config, store, id) {
+  try {
+    const { action } = read(config, store, id, 'worktree');
+    if (action.phase === 'restored') return action;
+    const ready = action.phase === 'quarantined' ? await unlockWorktreeForRestore(config, store, action) : action;
+    if (!['moved', 'unlocked'].includes(ready.phase)) throw new Error('Reconcile the pending worktree action before restoring');
+    const restored = await runWorktreeGit(config, store, ready, ['move', '--', ready.payloadPath, ready.originalPath], (tx, launch) => {
+      const { action } = read(config, tx, id, 'worktree');
+      if (!['moved', 'unlocked'].includes(action.phase) || location(action) !== 'payload') throw new Error('Verified unlocked worktree required before restoring');
+      const { registration } = worktreeRegistration(config, tx, action, action.payloadPath);
+      if (quarantineLock(action, registration)) throw new Error('Worktree unexpectedly locked before restoring');
+      tx.put('action', id, { ...action, phase: 'restoring', restoreCommand: { launch } });
+    });
+    if (restored.phase !== 'restored' || restored.restoreCommand.exitCode !== 0) throw new Error('Git worktree restore did not succeed');
+    return restored;
   } catch (error) { return failed(config, store, id, error); }
 }
 
@@ -305,16 +418,27 @@ export function purgeArtifact(config, store, decisionId) {
   } catch (error) { return failed(config, store, id, error); }
 }
 
+function reconcileWorktree(config, tx, { action, claim }) {
+  if (terminal.has(action.phase)) return action;
+  if (action.phase === 'moving') return reconcileWorktreeMove(config, tx, action, claim);
+  if (action.phase === 'locking') return reconcileWorktreeLock(config, tx, action, claim);
+  if (action.phase === 'unlocking') return reconcileWorktreeUnlock(config, tx, action, claim);
+  if (action.phase === 'restoring') return reconcileWorktreeRestore(config, tx, action, claim);
+  if (['moved', 'quarantined', 'unlocked'].includes(action.phase) && location(action) === 'payload') {
+    const { registration } = worktreeRegistration(config, tx, action, action.payloadPath, action.phase !== 'quarantined');
+    const identity = quarantineLock(action, registration);
+    if (action.phase === 'quarantined' ? !identity || !same(identity, action.lockIdentity) : identity) throw new Error('Worktree quarantine lock incarnation changed');
+    return action;
+  }
+  pendingWorktree(config, tx, action.id);
+  return complete(tx, action, claim, 'cancelled');
+}
+
 export function reconcile(config, store, actionId) {
   try {
     return store.transaction(tx => {
       if (tx.get('action', text(actionId, 'action ID'))?.value.kind === 'worktree') {
-        const owned = read(config, tx, actionId, 'worktree');
-        if (owned.action.phase === 'cancelled') return owned.action;
-        if (owned.action.phase === 'moving') return reconcileWorktreeMove(config, tx, owned.action, owned.claim);
-        if (owned.action.phase === 'moved' && location(owned.action) === 'payload') return owned.action;
-        const { action, claim } = pendingWorktree(config, tx, actionId);
-        return complete(tx, action, claim, 'cancelled');
+        return reconcileWorktree(config, tx, read(config, tx, actionId, 'worktree'));
       }
       const { action, claim } = read(config, tx, actionId);
       if (terminal.has(action.phase)) return action;

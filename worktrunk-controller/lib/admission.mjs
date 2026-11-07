@@ -10,7 +10,7 @@ function roots(paths) {
 }
 
 export function holdsWorktreeRepository(action) {
-  return action.kind === 'worktree' && ['intent', 'prepared', 'moving', 'moved'].includes(action.phase);
+  return action.kind === 'worktree' && ['intent', 'prepared', 'moving', 'moved', 'locking', 'unlocking', 'unlocked', 'restoring'].includes(action.phase);
 }
 
 function fences(tx, claim, root) {
@@ -22,12 +22,18 @@ function fences(tx, claim, root) {
     const containerPath = localPath(action.containerPath, { missing: true });
     result.push(containerPath);
     if (holdsWorktreeRepository(action)) {
-      for (const checkoutPath of action.repositoryPaths) result.push(localPath(checkoutPath, { missing: true }));
+      // Stable sibling payloads have their own physical claims throughout repository mutations.
+      const stablePayloads = new Set(tx.list('action').filter(({ value }) => {
+        if (value.kind !== 'worktree' || value.phase !== 'quarantined' || digest(value.repositoryIncarnation) !== digest(action.repositoryIncarnation)) return false;
+        const held = tx.get('claim', value.claimToken)?.value;
+        return held?.state === 'held' && held.actionId === value.id && held.roots[0]?.currentPath === value.payloadPath;
+      }).map(({ value }) => value.payloadPath));
+      for (const checkoutPath of action.repositoryPaths) if (!stablePayloads.has(checkoutPath)) result.push(localPath(checkoutPath, { missing: true }));
     }
     if (action.containerIdentity) {
       if (digest(fileIdentity(containerPath)) !== digest(action.containerIdentity)) throw new Error('Cleanup container changed');
     } else if (fs.existsSync(containerPath)) throw new Error('Cleanup container is unverified');
-    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['moved', 'quarantined', 'restoring', 'purging'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
+    if (root.currentPath && (root.currentPath !== action.payloadPath || path.dirname(root.currentPath) !== action.containerPath || !['moved', 'locking', 'quarantined', 'unlocking', 'unlocked', 'restoring', 'purging'].includes(action.phase))) throw new Error('Cleanup relocation unavailable');
   } else if (root.currentPath) throw new Error('Cleanup relocation has no action');
   if (digest(fileIdentity(root.currentPath ?? root.path)) !== digest(root.incarnation)) throw new Error('Claim incarnation changed');
   return result;
@@ -121,10 +127,15 @@ export function acquireCleanup(store, request, onAcquire = () => {}) {
     if (request.actionId !== undefined) record.actionId = text(request.actionId, 'action ID');
     tx.put('claim', token, record);
     if (onAcquire(tx, record)?.then) throw new Error('Cleanup intent callback must be synchronous');
-    const fenced = targets.flatMap(root => fences(tx, record, root).map(path => ({ path })));
-    if (conflicts(tx, fenced, true, token)) throw new Error('Active or unresolved owner/cleanup claim');
+    verifyCleanupFences(tx, record);
     return record;
   });
+}
+
+export function verifyCleanupFences(tx, claim) {
+  if (!tx.writing) throw new Error('Cleanup fences require a write transaction');
+  const fenced = claim.roots.flatMap(root => fences(tx, claim, root).map(path => ({ path })));
+  if (conflicts(tx, fenced, true, claim.token)) throw new Error('Active or unresolved owner/cleanup claim');
 }
 
 export function releaseCleanup(store, token) {
