@@ -134,9 +134,24 @@ try {
     else if (command === 'run') process.stdout.write(`Managed launch ${output.token} ended; exit ${output.exitCode ?? 'unavailable'}\n`);
     else if (['apply', 'purge', 'restore', 'reconcile'].includes(command)) process.stdout.write(`Action ${output.id}: ${output.phase}${output.purgeOutcome === 'interrupted' ? '; purge interrupted, only remaining contents can be restored' : ''}\n`);
     else if (command === 'report') {
-      process.stdout.write(`Observed first accepted tasks: ${output.observedFirstAcceptedTasks}\nFirst-attempt acceptance: ${output.firstAttemptOutcomes.accepted}/${output.firstAttemptOutcomes.total}; cancellations: ${output.firstAttemptOutcomes.cancelled}\n`);
+      const ms = value => value === null ? 'unavailable' : `${value} ms`;
+      const first = output.firstAttemptOutcomes;
+      const rate = first.total ? `${first.accepted}/${first.total}` : 'unavailable (no observed terminal first attempts)';
+      process.stdout.write(`Report window ${new Date(output.from).toISOString()} to ${new Date(output.to).toISOString()} (exclusive)\n`);
+      process.stdout.write(`Observed first accepted tasks: ${output.observedFirstAcceptedTasks}\nFirst-attempt acceptance: ${rate} (${first.failed} failed, ${first.cancelled} cancellations)\n`);
       for (const week of output.weeks) process.stdout.write(`  Week ${week.week}: ${week.observedFirstAcceptedTasks}\n`);
-      process.stdout.write(`Accepted task duration: median ${output.acceptedTaskDuration.medianMs ?? 'unavailable'} ms; p95 ${output.acceptedTaskDuration.p95Ms ?? 'unavailable'} ms; samples ${output.acceptedTaskDuration.samples}\n`);
+      const duration = output.acceptedTaskDuration;
+      process.stdout.write(`Accepted task duration: median ${ms(duration.medianMs)}, p95 ${ms(duration.p95Ms)}, ${duration.samples} samples, ${duration.unavailable} unavailable\n`);
+      process.stdout.write(`Observed task reopen events: ${output.observedReopens}, revocations: ${output.observedRevocations}\n`);
+      for (const [agent, count] of Object.entries(output.attribution.singleAgent)) process.stdout.write(`  Agent ${JSON.stringify(agent)} has ${count} attributed acceptances\n`);
+      process.stdout.write(`Attribution has ${output.attribution.multipleAgents} multi-agent acceptances and ${output.attribution.unavailable} unavailable\n`);
+      if (output.tasks.length) process.stdout.write(`Observed task status as of ${new Date(output.asOf).toISOString()}\n`);
+      for (const task of output.tasks) {
+        const unresolved = task.attempts.filter(attempt => attempt.terminal === null || attempt.terminal === 'ambiguous').length;
+        process.stdout.write(`  Task ${JSON.stringify(task.taskId)} in ${JSON.stringify(task.authorityProject)} on ${JSON.stringify(task.authority)} is ${task.currentOutcome}, with ${task.observedAttempts} observed attempts, ${task.observedRetries ?? 'unavailable'} observed retries, ${unresolved} unresolved and open age ${ms(task.openAgeMs)}\n`);
+      }
+      for (const session of output.sessions) process.stdout.write(`  Session ${JSON.stringify(session.sessionId)} on ${JSON.stringify(session.sourceInstance)} has ${ms(session.observedWorkingMs)} working and ${ms(session.observedWaitingMs)} waiting in observed intervals\n`);
+      for (const host of output.concurrency) process.stdout.write(`  Host ${JSON.stringify(host.instance)} has ${ms(host.observedOverlapMs)} observed overlap and a peak of ${host.maxObservedConcurrentSessions ?? 'unavailable'} concurrent sessions\n`);
       for (const project of output.backlog) {
         const summary = project.status === 'analysis_failed' ? `unavailable (${project.error})`
           : `${project.worktrees} observed; ${project.eligible} eligible; ${project.retained} retained; ${project.analysisFailed} analysis failed; ${project.staleRegistrations} stale registrations${project.policyCurrent ? '' : ' (previous policy)'}`;

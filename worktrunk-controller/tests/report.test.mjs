@@ -89,6 +89,56 @@ test('checkout inventory estimates allocation without altering content evidence'
   assert.deepEqual(read().checkoutEstimate, { estimatedReclaimableBytes: null, rebuildFiles: 2 });
 });
 
+test('text reports expose closed-window throughput and current unresolved work without writing state', t => {
+  const s = controller(t, process.execPath);
+  const raw = JSON.parse(fs.readFileSync(s.filename, 'utf8'));
+  raw.eventSources = [sources[0], sources[2]].map(source => ({ ...source, projects: ['myproject'] }));
+  fs.writeFileSync(s.filename, JSON.stringify(raw));
+  const settings = { ...s.config, eventSources: raw.eventSources };
+  const at = Date.parse('2026-01-02T00:00:00Z');
+  const store = new Store(s.state);
+  let eventId = 0;
+  const add = (source, type, elapsed, fields) => ingest(settings, store, source, {
+    version: 1, eventId: `text-${++eventId}`, project: 'myproject', type, at: at + elapsed, ...fields,
+  });
+  const task = (type, elapsed, fields = {}) => add('tasks', type, elapsed, { taskId: '1', authorityProject: 'queue', ...fields });
+  try {
+    task('task_started', 0);
+    task('attempt_failed', 10, { attemptId: 'one', attemptNumber: 1 });
+    task('attempt_accepted', 40, { attemptId: 'two', attemptNumber: 2, agentIds: ['agent\n-a'] });
+    task('task_reopened', 50);
+    task('attempt_started', 3 * day, { attemptId: 'three', attemptNumber: 3 });
+    add('host', 'working', 10, { sessionId: 'a' });
+    add('host', 'waiting', 20, { sessionId: 'a' });
+    add('host', 'session_ended', 40, { sessionId: 'a' });
+    add('host', 'working', 15, { sessionId: 'b' });
+    add('host', 'session_ended', 30, { sessionId: 'b' });
+    add('host', 'working', 50, { sessionId: 'c' });
+  } finally { store.close(); }
+  const filename = path.join(s.state, 'controller.sqlite');
+  const before = fs.readFileSync(filename);
+  const cli = path.resolve(import.meta.dirname, '../bin/controller.mjs');
+  const invoke = (format, from = '2026-01-01', to = '2026-01-03') => {
+    const result = spawnSync(process.execPath, [cli, 'report', '--config', s.filename, '--from', from, '--to', to, '--format', format], { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  const json = JSON.parse(invoke('json'));
+  assert.equal(json.observedFirstAcceptedTasks, 1);
+  assert.equal(json.tasks[0].openAgeMs, json.asOf - (at + 50));
+  assert.equal(json.tasks[0].attempts.at(-1).terminal, null);
+  const rendered = invoke('text');
+  assert.match(rendered, /First-attempt acceptance: 0\/1.*1 failed.*0 cancellations/);
+  assert.match(rendered, /Observed task reopen events: 1.*revocations: 0/);
+  assert.match(rendered, /Agent "agent\\n-a".*1 attributed acceptance/);
+  assert.match(rendered, /Task "1".*reopened.*3 observed attempts.*2 observed retries.*1 unresolved.*open age \d+ ms/);
+  assert.match(rendered, /Session "a".*10 ms working.*20 ms waiting/);
+  assert.match(rendered, /Session "c".*unavailable working.*unavailable waiting/);
+  assert.match(rendered, /Host "host-1".*15 ms observed overlap.*2 concurrent sessions/);
+  assert.match(invoke('text', '2026-01-06', '2026-01-07'), /First-attempt acceptance: unavailable/);
+  assert.deepEqual(fs.readFileSync(filename), before);
+});
+
 test('weekly distinct tasks, first-attempt cancellations, retries and accepted cohort durations are exact after replay', t => {
   const { store, add, read } = timeline(t);
   const task = (type, at, taskId, fields = {}) => add('tasks', type, at, { taskId, authorityProject: 'project-p', ...fields });

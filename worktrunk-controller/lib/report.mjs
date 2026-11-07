@@ -38,7 +38,7 @@ function taskProjection(key, events, now, githubIssue, launches) {
       id, number: numbers.size === 1 ? [...numbers][0] : null,
       startedAt: launch?.admittedAt ?? firstTime(rows.filter(row => row.type === 'attempt_started')),
       terminal: outcomes.size > 1 || conflictingHeads ? 'ambiguous' : ([...outcomes][0] ?? null), terminalAt: firstTime(terminals),
-      ...(launch ? { managed: { worktreeId: launch.task.worktreeId, endedAt: launch.endedAt, head: launch.endedHead } } : {}),
+      ...(launch?.completionVerified ? { managed: { worktreeId: launch.task.worktreeId, endedAt: launch.endedAt, head: launch.endedHead } } : {}),
     };
   }).sort((a, b) => (a.number ?? Infinity) - (b.number ?? Infinity) || a.id.localeCompare(b.id));
   const accepted = events.filter(event => event.type === 'attempt_accepted');
@@ -46,7 +46,7 @@ function taskProjection(key, events, now, githubIssue, launches) {
   const acceptedRows = accepted.filter(event => event.at === firstAcceptedAt);
   const agents = new Set(acceptedRows.map(row => JSON.stringify(row.agentIds)));
   const acceptedLaunch = launchByAttempt.get(acceptedRows[0]?.attemptId);
-  const matchedLaunch = acceptedLaunch && acceptedRows.every(row => acceptanceMatchesLaunch(row, acceptedLaunch));
+  const matchedLaunch = acceptedLaunch?.completionVerified && acceptedRows.every(row => acceptanceMatchesLaunch(row, acceptedLaunch));
   const firstLaunch = launchByAttempt.get('1');
   const projectConflict = new Set([...events.map(event => event.project), ...launches.map(launch => launch.task.project)]).size !== 1;
   const agentIds = isGitHub
@@ -62,17 +62,20 @@ function taskProjection(key, events, now, githubIssue, launches) {
   const ordinalKnown = projected.length > 0 && projected.every(attempt => attempt.number !== null) && new Set(projected.map(attempt => attempt.number)).size === projected.length;
   const firstAttempt = ordinalKnown ? projected.find(attempt => attempt.number === 1) ?? null : null;
   const sameTimeConflict = latest && stateRows.some(event => event.at === latest.at && event.type !== latest.type);
+  const currentOutcome = ambiguousClock || projectConflict || hasCurrentConflict || sameTimeConflict || !latest ? 'unknown'
+    : githubOutcome?.status ?? (latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked');
+  const openedAt = currentOutcome === 'reopened' ? latest.at : !latest && !accepted.length ? startedAt : null;
   return {
     id: key, authority: task.authority, authorityProject: task.authorityProject, taskId: task.taskId, project: task.project,
     ...(isGitHub ? { authorityObservedAt: githubIssue?.observedAt ?? null } : {}),
-    startedAt, firstAcceptedAt, currentOutcome: ambiguousClock || projectConflict || hasCurrentConflict || sameTimeConflict || !latest ? 'unknown' : githubOutcome?.status ?? (latest.type === 'attempt_accepted' ? 'accepted' : latest.type === 'task_reopened' ? 'reopened' : 'revoked'),
+    startedAt, firstAcceptedAt, currentOutcome,
     agentIds, attribution: agentIds.length === 1 ? 'single_agent' : agentIds.length > 1 ? 'multiple_agents' : 'unavailable',
     durationMs: !ambiguousClock && !projectConflict && !invalidOrdering && startedAt !== null && firstAcceptedAt !== null &&
-      (!isGitHub || (matchedLaunch && firstLaunch.task.sourceInstance === acceptedLaunch.task.sourceInstance && startedAt <= acceptedLaunch.admittedAt))
+      (!isGitHub || (matchedLaunch && firstLaunch?.completionVerified && firstLaunch.task.sourceInstance === acceptedLaunch.task.sourceInstance && startedAt <= acceptedLaunch.admittedAt))
       ? firstAcceptedAt - startedAt : null,
     attempts: projected, observedAttempts: projected.length, observedRetries: projected.length ? projected.length - 1 : null,
     firstAttempt: projectConflict || ambiguousClock || invalidOrdering || !firstAttempt || firstAttempt.terminal === 'ambiguous' ? null : firstAttempt,
-    openAgeMs: !latest && startedAt !== null && startedAt <= now && !ambiguousClock ? now - startedAt : null,
+    openAgeMs: openedAt !== null && openedAt <= now && !ambiguousClock && !projectConflict && !hasCurrentConflict && !invalidOrdering ? now - openedAt : null,
     timingStatus: ambiguousClock || projectConflict ? 'unavailable' : 'observed_partial',
   };
 }
@@ -144,9 +147,14 @@ export function report(config, store, { from, to, now = Date.now() }) {
   const launches = new Map();
   for (const { value } of store.list('claim')) {
     const task = value.task;
-    if (!endedManagedLaunch(value, now) || !registered.has(task.project)) continue;
+    if (!task || !registered.has(task.project)) continue;
+    const completionVerified = endedManagedLaunch(value, now);
+    const admissionRecorded = value.kind === 'producer' && ['running', 'unresolved'].includes(value.state) &&
+      value.evidence?.kind === 'windows_job' && value.evidence.launchToken === value.token && value.evidence.activeProcesses === null &&
+      Number.isSafeInteger(value.admittedAt) && value.admittedAt >= 0 && value.admittedAt <= now;
+    if (!completionVerified && !admissionRecorded) continue;
     const rows = launches.get(task.taskKey) ?? [];
-    rows.push(value); launches.set(task.taskKey, rows);
+    rows.push({ ...value, completionVerified }); launches.set(task.taskKey, rows);
     if (!taskGroups.has(task.taskKey)) taskGroups.set(task.taskKey, []);
   }
   const tasks = [...taskGroups].map(([key, rows]) => taskProjection(key, rows, now, githubIssues.get(key), launches.get(key) ?? [])).sort((a, b) => a.id.localeCompare(b.id));

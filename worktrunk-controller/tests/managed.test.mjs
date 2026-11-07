@@ -968,7 +968,12 @@ test('native managed launch and GitHub approval qualify only the unchanged linke
     const claim = store.list('claim')[0].value;
     assert.equal(claim.state, 'running');
     assert.equal(claim.endedHead, undefined);
-    assert.equal(report(config, store, { from: 0, to: Date.now() }).tasks.length, 0);
+    const tasks = report(config, store, { from: 0, to: Date.now() }).tasks;
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0].currentOutcome, 'unknown');
+    assert.equal(tasks[0].attempts[0].startedAt, claim.admittedAt);
+    assert.equal(tasks[0].attempts[0].terminal, null);
+    assert.equal(tasks[0].attempts[0].managed, undefined);
     const second = { ...launch, sessionId: 'second', args: ['-e', 'process.exit(99)'] };
     await assert.rejects(runManaged(config, store, second, read), /already has a launch claim/);
     await assert.rejects(runManaged(config, store, { ...second, github: undefined }), /exclusive producer admission/);

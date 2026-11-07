@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { digest } from '../lib/data.mjs';
-import { checkoutProducerFence, reserve } from '../lib/admission.mjs';
+import { checkoutProducerFence, reserve, transition } from '../lib/admission.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { ingest, syncGitHubIssue, syncKnownGitHubIssues } from '../lib/events.mjs';
 import { report } from '../lib/report.mjs';
@@ -184,8 +184,36 @@ test('throughput uses only matching ended launches and keeps GitHub authoritativ
   assert.equal(read().tasks[0].attribution, 'unavailable');
   assert.equal(read().tasks[0].durationMs, null);
   await sync([[retry, reopened]]);
-  assert.equal(read().tasks[0].currentOutcome, 'reopened');
+  const open = read();
+  assert.equal(open.tasks[0].currentOutcome, 'reopened');
+  assert.equal(open.tasks[0].openAgeMs, open.asOf - Date.parse(reopened.created_at));
   assert.equal(read().worktreeApplyEnabled, false);
+});
+
+test('an admitted GitHub attempt is unresolved before native completion is available', async t => {
+  const { config, store, sync, read } = setup(t);
+  const { taskId } = await sync([[]]);
+  const authorityProject = '22';
+  const task = { taskKey: digest(['github.com/issues', authorityProject, taskId]), sourceInstance: source.instance,
+    project: 'myproject', issue: 7, taskId, authorityProject, attempt: 1, agentId: 'agent-a', worktreeId: 'worktree-1' };
+  const { token } = reserve(store, { roots: [fixture(t)], owner: config.host.id, sessionId: 'agent-1', task });
+  transition(store, token, 'reserved', 'starting');
+  assert.deepEqual(read().tasks, []);
+  const { admittedAt } = transition(store, token, 'starting', 'running', { kind: 'windows_job', launchToken: token, helperPid: 123, activeProcesses: null });
+  const check = () => {
+    const observed = read();
+    const [attempted] = observed.tasks;
+    assert.equal(attempted.currentOutcome, 'unknown');
+    assert.equal(attempted.openAgeMs, observed.asOf - admittedAt);
+    assert.deepEqual(attempted.attempts, [{ id: '1', number: 1, startedAt: admittedAt, terminal: null, terminalAt: null }]);
+    assert.equal(attempted.durationMs, null);
+    assert.deepEqual(attempted.agentIds, []);
+    assert.equal(observed.firstAttemptOutcomes.total, 0);
+    assert.equal(observed.observedFirstAcceptedTasks, 0);
+  };
+  check();
+  transition(store, token, 'running', 'unresolved');
+  check();
 });
 
 test('worktree task evidence follows current exact acceptance, reopening and newer attempts', async t => {
